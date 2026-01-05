@@ -4,7 +4,11 @@ Field value evaluator - allows manual input of field values to see outputs
 from typing import Dict, Any, Optional
 import pandas as pd
 import re
+import logging
 from ..ast.field_ast import FieldNode, SASProgram, FieldOperationType
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 class FieldEvaluator:
@@ -84,22 +88,44 @@ class FieldEvaluator:
         Safely evaluate a mathematical expression
         Only allows basic arithmetic operations
         """
-        # Remove any remaining non-numeric characters except operators
-        allowed_chars = set('0123456789+-*/(). ')
-        
         # Check for SAS functions and handle them
         if any(func in expression.upper() for func in ['SUM', 'MEAN', 'MAX', 'MIN']):
             return self._eval_sas_function(expression)
         
-        # For simple arithmetic, use eval with restricted namespace
+        # For simple arithmetic, use ast.literal_eval for safer evaluation
+        # Only works with literals, but we can try basic arithmetic
         try:
-            # Only evaluate if it looks safe
-            if all(c in allowed_chars for c in expression):
-                return eval(expression, {"__builtins__": {}}, {})
-        except:
-            pass
-        
-        return expression  # Return as-is if can't evaluate
+            import ast
+            import operator
+            
+            # Define safe operators
+            operators = {
+                ast.Add: operator.add,
+                ast.Sub: operator.sub,
+                ast.Mult: operator.mul,
+                ast.Div: operator.truediv,
+                ast.USub: operator.neg,
+            }
+            
+            def eval_expr(node):
+                if isinstance(node, ast.Constant):  # Python 3.8+ constant
+                    return node.value
+                elif hasattr(ast, 'Num') and isinstance(node, ast.Num):  # Fallback for older Python
+                    return node.n
+                elif isinstance(node, ast.BinOp):  # binary operation
+                    return operators[type(node.op)](eval_expr(node.left), eval_expr(node.right))
+                elif isinstance(node, ast.UnaryOp):  # unary operation
+                    return operators[type(node.op)](eval_expr(node.operand))
+                else:
+                    raise ValueError(f"Unsupported operation: {type(node)}")
+            
+            # Parse and evaluate
+            tree = ast.parse(expression, mode='eval')
+            return eval_expr(tree.body)
+            
+        except Exception as e:
+            # If evaluation fails, return the expression as-is
+            return expression
     
     def _eval_sas_function(self, expression: str) -> Any:
         """
@@ -146,6 +172,7 @@ class FieldEvaluator:
                 break
         
         if not data_step:
+            logger.warning(f"No data step found for table '{table_name}'")
             return df
         
         result_df = df.copy()

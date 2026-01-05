@@ -241,9 +241,15 @@ def show_evaluate_fields(evaluator: FieldEvaluator, program: SASProgram):
                         key=f"field_{idx}"
                     )
                     if value:
+                        # Try to parse as numeric, fallback to string
                         try:
-                            input_data[field.name] = float(value) if '.' in value else int(value)
-                        except ValueError:
+                            import ast
+                            parsed = ast.literal_eval(value)
+                            if isinstance(parsed, (int, float)):
+                                input_data[field.name] = parsed
+                            else:
+                                input_data[field.name] = value
+                        except (ValueError, SyntaxError):
                             input_data[field.name] = value
         else:
             st.info("No source fields found in the SAS code.")

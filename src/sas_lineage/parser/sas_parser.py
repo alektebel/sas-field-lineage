@@ -9,6 +9,14 @@ from ..ast.field_ast import (
     ProcStepNode, SASProgram
 )
 
+# Common SAS keywords and functions that should not be treated as field references
+SAS_KEYWORDS = {
+    'sum', 'mean', 'max', 'min', 'count', 'put', 'input', 
+    'substr', 'trim', 'left', 'right', 'upcase', 'lowcase',
+    'if', 'then', 'else', 'do', 'end', 'where', 'and', 'or',
+    'data', 'set', 'merge', 'by', 'run', 'proc', 'quit'
+}
+
 
 class SASParser:
     """
@@ -179,14 +187,11 @@ class SASParser:
         cleaned_expr = re.sub(r'(\w+)\s*\(', '', expression)  # Remove function calls
         tokens = re.findall(r'\b([a-zA-Z_]\w*)\b', cleaned_expr)
         
-        # Filter out common SAS functions and keywords
-        sas_keywords = {'sum', 'mean', 'max', 'min', 'count', 'put', 'input', 
-                       'substr', 'trim', 'left', 'right', 'upcase', 'lowcase',
-                       'if', 'then', 'else', 'do', 'end', 'where', 'and', 'or'}
-        
+        # Filter out SAS keywords and functions
         for token in tokens:
-            if token.lower() not in sas_keywords and not token.isdigit():
+            if token.lower() not in SAS_KEYWORDS and not token.isdigit():
                 # Try to infer table from source tables
+                # Note: This defaults to first table which may be ambiguous
                 table = source_tables[0] if source_tables else None
                 if (token, table) not in references:
                     references.append((token, table))
