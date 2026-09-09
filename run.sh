@@ -1,11 +1,13 @@
 #!/bin/bash
-# Quick start script for SAS Field Lineage Tracker
+# Quick start script for the SAS Field Lineage Explorer web app.
+# The explorer is a zero-dependency (stdlib-only) web server + faithful web UI.
+# The legacy Streamlit app is still available at src/sas_lineage/ui/app.py.
 
-echo "🔍 SAS Field Lineage Tracker"
-echo "=============================="
+echo "🔍 Field Lineage & Golden Source Explorer"
+echo "=========================================="
 echo ""
 
-# Check if Python is available
+# Check Python is available
 if ! command -v python3 &> /dev/null; then
     echo "❌ Python 3 is not installed. Please install Python 3.8 or higher."
     exit 1
@@ -14,18 +16,12 @@ fi
 echo "✅ Python found: $(python3 --version)"
 echo ""
 
-# Check if dependencies are installed
-if ! python3 -c "import streamlit" 2> /dev/null; then
-    echo "📦 Installing dependencies..."
-    pip install -r requirements.txt
-    echo ""
-fi
-
-# Launch Streamlit app
-echo "🚀 Launching Streamlit application..."
-echo "   The app will open in your browser at http://localhost:8501"
-echo ""
-echo "   Press Ctrl+C to stop the server"
+# The explorer needs only the standard library + the bundled parser (networkx is
+# optional and already vendored functionality). It does NOT need streamlit.
+echo "🚀 Launching web explorer..."
+echo "   Open http://127.0.0.1:8010 in your browser"
+echo "   Press Ctrl+C to stop"
 echo ""
 
-python3 -m streamlit run src/sas_lineage/ui/app.py
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m sas_lineage.ui.server "$@"

@@ -1,8 +1,10 @@
 @echo off
-REM Quick start script for SAS Field Lineage Tracker (Windows)
+REM Quick start script for the SAS Field Lineage Explorer web app.
+REM The explorer is a zero-dependency (stdlib-only) web server + faithful web UI.
+REM The legacy Streamlit app is still available at src\sas_lineage\ui\app.py.
 
-echo SAS Field Lineage Tracker
-echo ==============================
+echo Field Lineage ^& Golden Source Explorer
+echo ========================================
 echo.
 
 REM Check if Python is available
@@ -15,19 +17,12 @@ if errorlevel 1 (
 echo Python found
 echo.
 
-REM Check if dependencies are installed
-python -c "import streamlit" >nul 2>&1
-if errorlevel 1 (
-    echo Installing dependencies...
-    pip install -r requirements.txt
-    echo.
-)
-
-REM Launch Streamlit app
-echo Launching Streamlit application...
-echo The app will open in your browser at http://localhost:8501
+REM The explorer needs only the standard library; it does NOT need streamlit.
+echo Launching web explorer...
+echo Open http://127.0.0.1:8010 in your browser
 echo.
-echo Press Ctrl+C to stop the server
+echo Press Ctrl+C to stop
 echo.
 
-python -m streamlit run src/sas_lineage/ui/app.py
+set PYTHONPATH=%CD%\src
+python -m sas_lineage.ui.server %*

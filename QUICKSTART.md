@@ -26,21 +26,27 @@
    run.bat
    ```
    
-   **Or manually:**
+   **Or manually (only stdlib needed — no pip install required):**
    ```bash
-   streamlit run src/sas_lineage/ui/app.py
+   PYTHONPATH=src python -m sas_lineage.ui.server
    ```
 
 ## First Steps
 
-### 1. Using the Web Interface
+### 1. Using the Web Explorer
 
-Once the Streamlit app launches:
+Open http://127.0.0.1:8010 in your browser. The explorer:
 
-1. **Upload SAS Code**: Click "Upload File" in the sidebar or use the example
-2. **Browse Fields**: View all fields organized by table
-3. **Query a Field**: Search for specific fields to see their lineage
-4. **Evaluate Fields**: Test calculations with sample data
+1. **Renders the layered lineage graph** (golden sources → landing → curated →
+   marts → reporting) with direction (↑ Upstream / ↕ Both / ↓ Downstream),
+   hop depth, zoom/LOD, search and a register sidebar.
+2. **Field trace** — click a dataset, then a field, for the complete trace from
+   its golden sources (per-hop dataset, register, transform, merges).
+3. **Value at every hop** — enter golden inputs (or upload a contract-cycle
+   workbook), hit *Run value forward*, and watch the value propagate hop by hop
+   across the graph.
+4. **Live import** — use *Import SAS source* in the header to re-parse a `.sas`
+   program and re-render the whole view.
 
 ### 2. Using the CLI
 

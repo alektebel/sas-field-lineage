@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+  /* Vendored runtime — point the DataCamp CDN loader at local files so the
+     app runs fully offline (no unpkg / Google CDN needed). */
+  window.__resources = {
+    "https://unpkg.com/react@18.3.1/umd/react.production.min.js": "/vendor/react.production.min.js",
+    "https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js": "/vendor/react-dom.production.min.js",
+    "https://unpkg.com/@babel/standalone@7.29.0/babel.min.js": "/vendor/babel.min.js"
+  };
+</script>
+<script src="./support.js"></script>
+</head>
+<body>
+<script>
+  /* Live-backend bridge for the explorer component. Runs before the DC
+     runtime boots (body scripts execute during HTML parse). */
+  window.__load = async function () {
+    var r = await fetch("/api/demo", { headers: { "Accept": "application/json" } });
+    if (!r.ok) throw new Error("demo load failed: " + r.status);
+    return await r.json();
+  };
+  window.__parse = async function (code, expand) {
+    var r = await fetch("/api/parse", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ code: code, expand_macros: !!expand })
+    });
+    if (!r.ok) throw new Error("parse failed: " + r.status);
+    return await r.json();
+  };
+  window.__runField = async function (field, vals) {
+    var r = await fetch("/api/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ field: field, vals: vals })
+    });
+    if (!r.ok) throw new Error("run failed: " + r.status);
+    var j = await r.json();
+    return j.rows || [];
+  };
+  window.__explain = async function (field, kind, other) {
+    var r = await fetch("/api/explain", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ field: field, kind: kind, other: other || "" })
+    });
+    if (!r.ok) throw new Error("explain failed: " + r.status);
+    return await r.json();
+  };
+</script>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="_ds/broadsheet-6b65f295-e078-4568-8899-ef1844ee1263/styles.css">
+<script src="_ds/broadsheet-6b65f295-e078-4568-8899-ef1844ee1263/_ds_bundle.js"></script>
+<style>
+  body { margin:0; background:#f3f2f2; }
+  a { color:#d04a02; text-decoration:none; }
+  a:hover { color:#a83a02; text-decoration:underline; }
+  *::-webkit-scrollbar { width:10px; height:10px; }
+  *::-webkit-scrollbar-thumb { background:#dcd8d4; }
+  button:focus-visible, input:focus-visible { outline:2px solid #d04a02; outline-offset:2px; }
+</style>
+</helmet>
+
+<div style="display:flex;flex-direction:column;height:100vh;min-height:680px;background:#f3f2f2;color:#2d2d2d;font-family:'Source Serif 4',Georgia,serif;font-size:14px;overflow:hidden">
+
+  <header style="display:flex;align-items:flex-end;justify-content:space-between;gap:32px;flex-wrap:wrap;padding:18px 26px 12px 26px;border-bottom:2px solid #2d2d2d">
+    <div style="display:flex;flex-direction:column;gap:4px">
+      <div style="font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:#d04a02">Data Governance · Register Trace</div>
+      <h1 style="margin:0;font-size:26px;font-weight:600;letter-spacing:-.01em;line-height:1.1">Field Lineage &amp; Golden Source Explorer</h1>
+    </div>
+    <div style="display:flex;gap:24px;align-items:flex-end;flex-wrap:wrap;padding-bottom:3px">
+      <div style="display:flex;flex-direction:column"><span style="font-size:21px;line-height:1">{{ statFields }}</span><span style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#5c5c5c">Traced fields</span></div>
+      <div style="display:flex;flex-direction:column"><span style="font-size:21px;line-height:1;color:#eb8c00">{{ statGolden }}</span><span style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#5c5c5c">Golden sources</span></div>
+      <div style="display:flex;flex-direction:column"><span style="font-size:21px;line-height:1">{{ statRegisters }}</span><span style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#5c5c5c">Registers</span></div>
+      <div style="display:flex;flex-direction:column"><span style="font-size:21px;line-height:1">{{ statNodes }}</span><span style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#5c5c5c">Datasets</span></div>
+    </div>
+  </header>
+
+  <div style="display:flex;align-items:center;gap:20px;padding:10px 26px;border-bottom:1px solid #dcd8d4;background:#fbfaf9;flex-wrap:wrap">
+    <div style="display:flex;align-items:center;gap:9px">
+      <span style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#5c5c5c">Direction</span>
+      <div style="display:flex;gap:0;flex-wrap:nowrap;border:1px solid #cfcac5">
+        <button onClick="{{ setUp }}" style="font-family:inherit;font-size:12px;padding:5px 12px;border:0;cursor:pointer;white-space:nowrap;background:{{ upBg }};color:{{ upFg }}">↑ Upstream</button>
+        <button onClick="{{ setBoth }}" style="font-family:inherit;font-size:12px;padding:5px 12px;border:0;border-left:1px solid #cfcac5;border-right:1px solid #cfcac5;cursor:pointer;white-space:nowrap;background:{{ bothBg }};color:{{ bothFg }}">↕ Both</button>
+        <button onClick="{{ setDown }}" style="font-family:inherit;font-size:12px;padding:5px 12px;border:0;cursor:pointer;white-space:nowrap;background:{{ downBg }};color:{{ downFg }}">↓ Downstream</button>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:9px">
+      <span style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#5c5c5c">Hops</span>
+      <div style="display:flex;gap:5px">
+        <sc-for list="{{ depths }}" as="d" hint-placeholder-count="4">
+          <button onClick="{{ d.onClick }}" style="font-family:inherit;font-size:12px;min-width:29px;padding:4px 7px;cursor:pointer;background:{{ d.bg }};color:{{ d.fg }};border:1px solid {{ d.border }}">{{ d.label }}</button>
+        </sc-for>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:7px">
+      <span style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#5c5c5c">Zoom</span>
+      <button onClick="{{ zoomOut }}" style="font-family:inherit;font-size:14px;line-height:1;width:26px;height:25px;cursor:pointer;background:#fff;border:1px solid #cfcac5;color:#2d2d2d" style-hover="background:#ece9e6">−</button>
+      <span style="font-size:12px;min-width:38px;text-align:center;font-variant-numeric:tabular-nums">{{ zoomPct }}</span>
+      <button onClick="{{ zoomIn }}" style="font-family:inherit;font-size:14px;line-height:1;width:26px;height:25px;cursor:pointer;background:#fff;border:1px solid #cfcac5;color:#2d2d2d" style-hover="background:#ece9e6">+</button>
+      <button onClick="{{ zoomFit }}" style="font-family:inherit;font-size:12px;padding:4px 9px;cursor:pointer;white-space:nowrap;background:{{ fitBg }};color:{{ fitFg }};border:1px solid {{ fitBorder }}">Fit</button>
+      <span style="font-size:11px;color:#8a8480;white-space:nowrap">{{ lodLabel }}</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-left:auto">
+      <button onClick="{{ toggleLeft }}" style="font-family:inherit;font-size:12px;padding:6px 10px;border:1px solid #cfcac5;background:{{ leftBtnBg }};color:#2d2d2d;cursor:pointer;white-space:nowrap">{{ leftBtnLabel }}</button>
+      <button onClick="{{ toggleRight }}" style="font-family:inherit;font-size:12px;padding:6px 10px;border:1px solid #cfcac5;background:{{ rightBtnBg }};color:#2d2d2d;cursor:pointer;white-space:nowrap">{{ rightBtnLabel }}</button>
+      <input value="{{ q }}" onInput="{{ onQuery }}" placeholder="Search dataset, register or field…" style="font-family:inherit;font-size:13px;padding:6px 10px;flex:1 1 140px;min-width:120px;max-width:240px;border:1px solid #cfcac5;background:#fff;color:#2d2d2d" />
+      <button onClick="{{ reset }}" style="font-family:inherit;font-size:12px;padding:6px 11px;border:1px solid #2d2d2d;background:#fff;cursor:pointer;white-space:nowrap;color:#2d2d2d" style-hover="background:#2d2d2d;color:#fff">Reset</button>
+    </div>
+  </div>
+
+  <div style="display:flex;align-items:center;gap:14px;padding:6px 26px;border-bottom:1px solid #e6e2de;background:#f6f5f4;font-size:11.5px;color:#8a8480;flex-wrap:wrap">
+    <button onClick="{{ toggleImport }}" style="font-family:inherit;font-size:11.5px;padding:0;border:0;background:none;color:#5c5c5c;cursor:pointer;text-decoration:underline;text-decoration-color:#cfcac5;white-space:nowrap">{{ importLabel }}</button>
+    <sc-if value="{{ importOpen }}" hint-placeholder-val="{{ true }}">
+      <span style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <input type="file" accept=".sas,.egp,.txt" onChange="{{ onSasFile }}" style="font-family:inherit;font-size:11.5px;max-width:250px" />
+        <button onClick="{{ toggleExpandMacro }}" style="font-family:inherit;font-size:11.5px;padding:4px 8px;border:1px solid {{ macroBorder }};background:{{ macroBg }};color:{{ macroFg }};cursor:pointer;white-space:nowrap" title="Expand %macro/%do/%if/&code before parsing; non-destructive and optional">{{ macroLabel }}</button>
+        <span style="color:#2d2d2d">{{ sasSummary }}</span>
+        <sc-if value="{{ sasSummary }}" hint-placeholder-val="{{ true }}">
+          <button onClick="{{ clearSas }}" style="font-family:inherit;font-size:11.5px;border:0;background:none;color:#d04a02;cursor:pointer;text-decoration:underline">discard</button>
+        </sc-if>
+      </span>
+    </sc-if>
+    <span style="margin-left:auto;white-space:nowrap">Double-click a field to run values through the graph · ⌘/Ctrl + scroll to zoom</span>
+  </div>
+
+  <div style="display:flex;flex:1;min-height:0">
+
+    <aside style="width:282px;flex:none;border-right:1px solid #dcd8d4;overflow:auto;padding:16px 16px 40px 22px;background:#f3f2f2;display:{{ leftDisplay }}">
+      <div style="font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#5c5c5c;margin-bottom:12px">Registers &amp; datasets</div>
+      <sc-for list="{{ groups }}" as="g" hint-placeholder-count="5">
+        <div style="margin-bottom:20px">
+          <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:6px">
+            <span style="width:7px;height:7px;flex:none;background:{{ g.dot }}"></span>
+            <span style="font-size:13px;font-weight:600">{{ g.name }}</span>
+            <span style="font-size:11px;color:#8a8480;margin-left:auto">{{ g.count }}</span>
+          </div>
+          <sc-for list="{{ g.nodes }}" as="n" hint-placeholder-count="3">
+            <div onClick="{{ n.onClick }}" style="cursor:pointer;padding:5px 8px 5px 14px;border-left:3px solid {{ n.railColor }};background:{{ n.rowBg }};margin-bottom:3px" style-hover="background:#ece9e6">
+              <div style="font-size:13px;line-height:1.25">{{ n.name }}</div>
+              <div style="font-size:10.5px;color:#8a8480">{{ n.system }} · {{ n.fieldCount }} fields</div>
+            </div>
+          </sc-for>
+        </div>
+      </sc-for>
+    </aside>
+
+    <main ref="{{ mainRef }}" style="flex:1 1 0;min-width:0;overflow:auto;position:relative;background:#f9f8f7">
+      <div style="position:sticky;top:0;z-index:3;display:flex;gap:16px;align-items:center;padding:7px 18px;background:rgba(249,248,247,.94);border-bottom:1px solid #e6e2de;font-size:11px;color:#5c5c5c;flex-wrap:wrap">
+        <span style="display:flex;align-items:center;gap:6px"><span style="width:15px;height:3px;background:#d04a02"></span>Field trace</span>
+        <span style="display:flex;align-items:center;gap:6px"><span style="width:15px;height:3px;background:#ffb600"></span>Contributing source</span>
+        <span style="display:flex;align-items:center;gap:6px"><span style="width:15px;height:3px;background:#e0301e"></span>Upstream</span>
+        <span style="display:flex;align-items:center;gap:6px"><span style="width:15px;height:3px;background:#eb8c00"></span>Downstream</span>
+        <span style="margin-left:auto;color:#2d2d2d">{{ viewLabel }}</span>
+      </div>
+
+      <div style="position:relative;width:{{ boardW }}px;height:{{ boardH }}px">
+      <div style="position:absolute;left:0;top:0;width:{{ rawW }}px;height:{{ rawH }}px;transform:scale({{ scale }});transform-origin:0 0">
+        <svg width="{{ rawW }}" height="{{ rawH }}" style="position:absolute;left:0;top:0;overflow:visible">
+          <sc-for list="{{ edges }}" as="e" hint-placeholder-count="18">
+            <path d="{{ e.d }}" fill="none" stroke="{{ e.stroke }}" stroke-width="{{ e.w }}" stroke-dasharray="{{ e.dash }}" opacity="{{ e.op }}"></path>
+          </sc-for>
+        </svg>
+
+        <sc-for list="{{ lanes }}" as="l" hint-placeholder-count="5">
+          <div style="position:absolute;left:{{ l.x }}px;top:6px;width:262px;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#8a8480">{{ l.label }}</div>
+        </sc-for>
+
+        <sc-for list="{{ clusters }}" as="c" hint-placeholder-count="0">
+          <div onClick="{{ c.onClick }}" style="position:absolute;left:{{ c.x }}px;top:{{ c.y }}px;width:262px;height:{{ c.h }}px;box-sizing:border-box;padding:18px 18px;background:{{ c.bg }};border:1px solid {{ c.border }};border-left:6px solid {{ c.rail }};opacity:{{ c.op }};cursor:pointer" style-hover="background:#fff">
+            <div style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#8a8480">{{ c.kicker }}</div>
+            <div style="font-size:30px;font-weight:600;line-height:1.1;margin-top:8px">{{ c.label }}</div>
+            <div style="font-size:19px;color:#5c5c5c;margin-top:6px">{{ c.count }} datasets · {{ c.fieldTotal }} fields</div>
+            <sc-if value="{{ c.chip }}" hint-placeholder-val="{{ true }}">
+              <div style="margin-top:14px;display:inline-block;background:#fdeee4;padding:6px 10px;font-family:ui-monospace,Menlo,monospace;font-size:17px;color:#d04a02">{{ c.chip }}</div>
+            </sc-if>
+            <sc-if value="{{ c.value }}" hint-placeholder-val="{{ true }}">
+              <div style="margin-top:10px;font-family:ui-monospace,Menlo,monospace;font-size:20px;color:#2d2d2d">{{ c.value }}</div>
+            </sc-if>
+          </div>
+        </sc-for>
+
+        <sc-for list="{{ nodes }}" as="n" hint-placeholder-count="16">
+          <div onClick="{{ n.onClick }}" style="position:absolute;left:{{ n.x }}px;top:{{ n.y }}px;width:262px;box-sizing:border-box;padding:10px 12px 11px 13px;background:{{ n.bg }};border:1px solid {{ n.border }};border-left:4px solid {{ n.rail }};opacity:{{ n.op }};box-shadow:{{ n.shadow }};cursor:pointer;transition:opacity .18s,box-shadow .18s" style-hover="box-shadow:0 3px 10px rgba(45,45,45,.16)">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+              <span style="font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:{{ n.kickerFg }}">{{ n.register }}</span>
+              <sc-if value="{{ n.isGolden }}" hint-placeholder-val="{{ true }}"><span style="font-size:9px;letter-spacing:.12em;text-transform:uppercase;background:#ffb600;color:#2d2d2d;padding:1px 5px">Golden</span></sc-if>
+            </div>
+            <div style="font-size:15px;font-weight:600;line-height:1.2;margin-top:3px">{{ n.name }}</div>
+            <div style="font-size:11px;color:#8a8480;margin-top:2px">{{ n.system }} · {{ n.fieldCount }} fields</div>
+            <sc-if value="{{ n.chip }}" hint-placeholder-val="{{ true }}">
+              <div style="margin-top:7px;display:flex;align-items:center;justify-content:space-between;gap:8px;background:{{ n.chipBg }};padding:3px 7px">
+                <span style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:#2d2d2d">{{ n.chip }}</span>
+                <sc-if value="{{ n.value }}" hint-placeholder-val="{{ true }}">
+                  <span style="font-family:ui-monospace,Menlo,monospace;font-size:12px;font-weight:600;color:#d04a02;white-space:nowrap">{{ n.value }}</span>
+                </sc-if>
+              </div>
+            </sc-if>
+            <sc-for list="{{ n.detailFields }}" as="df" hint-placeholder-count="0">
+              <div onClick="{{ df.onClick }}" onDoubleClick="{{ df.onDbl }}" style="display:flex;justify-content:space-between;gap:8px;padding:4px 0;border-top:1px solid #eeeae6;cursor:pointer" style-hover="background:#faf6f2">
+                <span style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:{{ df.fg }}">{{ df.name }}</span>
+                <span style="font-size:11px;color:#8a8480;text-align:right">{{ df.meta }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </sc-for>
+      </div>
+      </div>
+    </main>
+
+    <aside style="flex:0 1 412px;min-width:330px;border-left:1px solid #dcd8d4;overflow:auto;padding:18px 22px 60px 22px;background:#f3f2f2;display:{{ rightDisplay }}">
+
+      <sc-if value="{{ showValue }}" hint-placeholder-val="{{ true }}">
+        <div>
+          <button onClick="{{ backToTrace }}" style="font-family:inherit;font-size:11.5px;border:0;background:none;padding:0;color:#d04a02;cursor:pointer;text-decoration:underline">← back to lineage trace</button>
+          <div style="font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#d04a02;margin-top:12px">Value run</div>
+          <div style="font-family:ui-monospace,Menlo,monospace;font-size:19px;margin-top:5px">{{ v.name }}</div>
+          <div style="font-size:12.5px;color:#5c5c5c;margin-top:3px;line-height:1.5">{{ v.blurb }}</div>
+
+          <div style="margin-top:16px;padding:11px 12px;background:#fffdf7;border-left:3px solid #ffb600">
+            <div style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#8a8480">Contract-cycle workbook</div>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:7px;flex-wrap:wrap">
+              <input type="file" accept=".xlsx,.xls,.csv,.txt" onChange="{{ onDataFile }}" style="font-family:inherit;font-size:11.5px;max-width:210px" />
+              <span style="font-size:11.5px;color:#2d2d2d">{{ v.fileNote }}</span>
+            </div>
+            <div style="font-size:11.5px;color:#8a8480;margin-top:6px;line-height:1.45">Columns are matched to the required inputs by name. Anything unmatched stays editable below.</div>
+          </div>
+
+          <div style="margin-top:20px;padding-top:12px;border-top:2px solid #2d2d2d;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#5c5c5c">Minimal inputs required — {{ v.inputCount }} values from {{ v.tableCount }} tables</div>
+
+          <sc-for list="{{ v.tables }}" as="t" hint-placeholder-count="2">
+            <div style="margin-top:16px">
+              <div style="display:flex;align-items:baseline;gap:8px">
+                <span style="font-size:13px;font-weight:600">{{ t.nodeName }}</span>
+                <sc-if value="{{ t.isGolden }}" hint-placeholder-val="{{ true }}"><span style="font-size:9px;letter-spacing:.12em;text-transform:uppercase;background:#ffb600;padding:1px 5px">Golden</span></sc-if>
+              </div>
+              <div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#8a8480;margin-top:2px">{{ t.register }}</div>
+              <sc-for list="{{ t.inputs }}" as="i" hint-placeholder-count="2">
+                <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+                  <div style="flex:1 1 auto;min-width:0">
+                    <div style="font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#2d2d2d">{{ i.field }}</div>
+                    <div style="font-size:11px;color:#8a8480;line-height:1.35">{{ i.label }}</div>
+                  </div>
+                  <input value="{{ i.value }}" onChange="{{ i.onChange }}" onInput="{{ i.onChange }}" style="font-family:ui-monospace,Menlo,monospace;font-size:12.5px;padding:5px 8px;width:126px;flex:none;text-align:right;border:1px solid {{ i.border }};background:{{ i.bg }};color:#2d2d2d" />
+                </div>
+              </sc-for>
+            </div>
+          </sc-for>
+
+          <button onClick="{{ v.run }}" style="font-family:inherit;font-size:13px;margin-top:20px;padding:9px 16px;width:100%;border:0;background:#d04a02;color:#fff;cursor:pointer" style-hover="background:#a83a02">Run value forward →</button>
+
+          <sc-if value="{{ v.hasResult }}" hint-placeholder-val="{{ true }}">
+            <div>
+              <div style="margin-top:22px;padding-top:12px;border-top:2px solid #2d2d2d;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#5c5c5c">Value at every hop</div>
+              <sc-for list="{{ v.results }}" as="r" hint-placeholder-count="4">
+                <div style="display:grid;grid-template-columns:24px 1fr;gap:11px;padding:11px 0;border-bottom:1px solid #e6e2de">
+                  <span style="width:22px;height:22px;display:flex;align-items:center;justify-content:center;font-size:11.5px;background:{{ r.numBg }};color:{{ r.numFg }}">{{ r.n }}</span>
+                  <div>
+                    <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline">
+                      <span style="font-size:13.5px;font-weight:600">{{ r.nodeName }}</span>
+                      <span style="font-family:ui-monospace,Menlo,monospace;font-size:13.5px;color:#d04a02;text-align:right">{{ r.value }}</span>
+                    </div>
+                    <div style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:#5c5c5c;margin-top:3px">{{ r.field }}</div>
+                    <div style="font-size:12px;color:#3f3c3a;line-height:1.45;margin-top:4px;text-wrap:pretty">{{ r.expr }}</div>
+                  </div>
+                </div>
+              </sc-for>
+              <div style="margin-top:16px;padding:14px 16px;background:#2d2d2d;color:#fff">
+                <div style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#ffb600">Final value · {{ v.name }}</div>
+                <div style="font-family:ui-monospace,Menlo,monospace;font-size:24px;margin-top:5px">{{ v.finalValue }}</div>
+                <div style="font-size:11.5px;color:#cfcac5;margin-top:5px">{{ v.finalNote }}</div>
+              </div>
+            </div>
+          </sc-if>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ showField }}" hint-placeholder-val="{{ true }}">
+        <div>
+          <div style="font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#d04a02">Field trace</div>
+          <div style="font-family:ui-monospace,Menlo,monospace;font-size:19px;margin-top:6px;line-height:1.2">{{ f.name }}</div>
+          <div style="font-size:12.5px;color:#5c5c5c;margin-top:3px">{{ f.nodeName }} · {{ f.dtype }}</div>
+          <button onClick="{{ f.openValue }}" style="font-family:inherit;font-size:12px;margin-top:10px;padding:6px 11px;border:1px solid #d04a02;background:#fff;color:#d04a02;cursor:pointer" style-hover="background:#d04a02;color:#fff">Run a value through this trace</button>
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;margin-top:16px">
+            <div><div style="font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#8a8480">Owner</div><div style="font-size:13px">{{ f.owner }}</div></div>
+            <div><div style="font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#8a8480">Classification</div><div style="font-size:13px">{{ f.classification }}</div></div>
+            <div><div style="font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#8a8480">Hops to golden</div><div style="font-size:13px">{{ f.hops }}</div></div>
+            <div><div style="font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#8a8480">Quality score</div><div style="font-size:13px;color:{{ f.qualityFg }}">{{ f.quality }}</div></div>
+          </div>
+
+          <div style="margin-top:18px;font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#8a8480">Golden sources</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+            <sc-for list="{{ f.golden }}" as="g" hint-placeholder-count="2">
+              <span style="font-size:11.5px;background:#fff3d6;border-left:3px solid #ffb600;padding:3px 8px">{{ g }}</span>
+            </sc-for>
+          </div>
+
+          <div style="margin-top:16px;font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#8a8480">Registers crossed</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+            <sc-for list="{{ f.registers }}" as="r" hint-placeholder-count="4">
+              <span style="font-size:11.5px;border:1px solid #cfcac5;padding:3px 8px;background:#fff">{{ r }}</span>
+            </sc-for>
+          </div>
+
+          <div style="margin-top:22px;padding-top:12px;border-top:2px solid #2d2d2d;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#5c5c5c">Complete trace — golden source to field</div>
+
+          <sc-for list="{{ f.steps }}" as="s" hint-placeholder-count="4">
+            <div style="display:grid;grid-template-columns:26px 1fr;gap:12px;padding:13px 0;border-bottom:1px solid #e6e2de">
+              <div style="display:flex;flex-direction:column;align-items:center;gap:5px">
+                <span style="width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-size:12px;background:{{ s.numBg }};color:{{ s.numFg }}">{{ s.n }}</span>
+                <span style="flex:1;width:1px;background:#dcd8d4"></span>
+              </div>
+              <div>
+                <div style="display:flex;align-items:baseline;gap:8px">
+                  <span style="font-size:14px;font-weight:600;line-height:1.2">{{ s.nodeName }}</span>
+                  <sc-if value="{{ s.isGolden }}" hint-placeholder-val="{{ true }}"><span style="font-size:9px;letter-spacing:.12em;text-transform:uppercase;background:#ffb600;padding:1px 5px">Golden</span></sc-if>
+                </div>
+                <div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#8a8480;margin-top:2px">{{ s.register }}</div>
+                <div style="font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:#d04a02;margin-top:6px">{{ s.field }}</div>
+                <div style="font-size:12.5px;line-height:1.45;color:#3f3c3a;margin-top:5px;text-wrap:pretty">{{ s.transform }}</div>
+                <sc-if value="{{ s.job }}" hint-placeholder-val="{{ true }}">
+                  <div style="font-size:11px;color:#8a8480;margin-top:5px">Job {{ s.job }}</div>
+                </sc-if>
+                <sc-for list="{{ s.merge }}" as="m" hint-placeholder-count="0">
+                  <div style="margin-top:8px;padding:7px 9px;background:#fff8e8;border-left:3px solid #ffb600">
+                    <div style="font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#8a8480">Joined in</div>
+                    <div style="font-size:12.5px;margin-top:2px">{{ m.nodeName }} · <span style="font-family:ui-monospace,Menlo,monospace">{{ m.field }}</span></div>
+                    <div style="font-size:11.5px;color:#5c5c5c;line-height:1.4;margin-top:2px">{{ m.note }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </sc-for>
+
+          <div style="margin-top:18px;font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#8a8480">Downstream consumers</div>
+          <sc-for list="{{ f.consumers }}" as="c" hint-placeholder-count="2">
+            <div onClick="{{ c.onClick }}" style="cursor:pointer;display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid #e6e2de" style-hover="color:#d04a02">
+              <span style="font-size:13px">{{ c.name }}</span>
+              <span style="font-size:11px;color:#8a8480">{{ c.register }}</span>
+            </div>
+          </sc-for>
+
+          <div style="margin-top:20px;padding-top:12px;border-top:2px solid #2d2d2d">
+            <div style="font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#5c5c5c;margin-bottom:8px">Plain-English explainer <span style="text-transform:none;letter-spacing:0;color:#8a8480">· <span style="color:{{ explainSrcFg }}">{{ explainSrc }}</span></span></div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button onClick="{{ explainTrace }}" style="font-family:inherit;font-size:12px;padding:6px 10px;border:1px solid #2d2d2d;background:#fff;cursor:pointer;color:#2d2d2d" style-hover="background:#2d2d2d;color:#fff">Explain construction</button>
+              <button onClick="{{ explainDown }}" style="font-family:inherit;font-size:12px;padding:6px 10px;border:1px solid #2d2d2d;background:#fff;cursor:pointer;color:#2d2d2d" style-hover="background:#2d2d2d;color:#fff">What happens downstream?</button>
+            </div>
+            <div style="display:flex;gap:6px;margin-top:8px">
+              <input value="{{ explainOther }}" onInput="{{ onExplainOther }}" placeholder="other field, e.g. raw_sales.price" style="font-family:inherit;font-size:12px;padding:6px 10px;flex:1 1 120px;min-width:0;border:1px solid #cfcac5;background:#fff;color:#2d2d2d" />
+              <button onClick="{{ explainAffected }}" style="font-family:inherit;font-size:12px;padding:6px 10px;border:1px solid #cfcac5;background:#fbfaf9;cursor:pointer;white-space:nowrap;color:#2d2d2d">Affected by it?</button>
+            </div>
+            <sc-if value="{{ explainBusy }}" hint-placeholder-val="{{ false }}">
+              <div style="font-size:12px;color:#8a8480;margin-top:8px">Asking the lineage SLM…</div>
+            </sc-if>
+            <sc-if value="{{ explainText }}" hint-placeholder-val="{{ false }}">
+              <pre style="font-family:ui-monospace,Menlo,monospace;font-size:12px;line-height:1.5;background:#fff;border:1px solid #dcd8d4;border-left:3px solid #d04a02;padding:10px 12px;margin:10px 0 0 0;white-space:pre-wrap;word-break:break-word">{{ explainText }}</pre>
+            </sc-if>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ showNode }}" hint-placeholder-val="{{ true }}">
+        <div>
+          <div style="font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:{{ nd.kickerFg }}">{{ nd.layer }}</div>
+          <div style="font-size:21px;font-weight:600;margin-top:6px;line-height:1.15">{{ nd.name }}</div>
+          <div style="font-size:12.5px;color:#5c5c5c;margin-top:3px">{{ nd.system }} · {{ nd.register }}</div>
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;margin-top:16px">
+            <div><div style="font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#8a8480">Steward</div><div style="font-size:13px">{{ nd.steward }}</div></div>
+            <div><div style="font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#8a8480">Refresh</div><div style="font-size:13px">{{ nd.refresh }}</div></div>
+            <div><div style="font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#8a8480">Fields</div><div style="font-size:13px">{{ nd.fieldCount }}</div></div>
+            <div><div style="font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:#8a8480">Traced fields</div><div style="font-size:13px">{{ nd.mappedCount }}</div></div>
+          </div>
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:20px;padding-top:12px;border-top:2px solid #2d2d2d">
+            <div>
+              <div style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#e0301e">↑ Upstream registers</div>
+              <div style="font-size:19px;margin:4px 0 6px 0">{{ nd.upCount }} <span style="font-size:11px;color:#8a8480">datasets</span></div>
+              <sc-for list="{{ nd.upRegisters }}" as="r" hint-placeholder-count="2">
+                <div style="font-size:12.5px;padding:3px 0 3px 8px;border-left:3px solid #e0301e;margin-bottom:3px">{{ r }}</div>
+              </sc-for>
+            </div>
+            <div>
+              <div style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#eb8c00">↓ Downstream registers</div>
+              <div style="font-size:19px;margin:4px 0 6px 0">{{ nd.downCount }} <span style="font-size:11px;color:#8a8480">datasets</span></div>
+              <sc-for list="{{ nd.downRegisters }}" as="r" hint-placeholder-count="2">
+                <div style="font-size:12.5px;padding:3px 0 3px 8px;border-left:3px solid #eb8c00;margin-bottom:3px">{{ r }}</div>
+              </sc-for>
+            </div>
+          </div>
+
+          <div style="margin-top:22px;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#5c5c5c">Fields with mapped lineage</div>
+          <sc-for list="{{ nd.fields }}" as="fl" hint-placeholder-count="3">
+            <div onClick="{{ fl.onClick }}" onDoubleClick="{{ fl.onDbl }}" style="cursor:pointer;padding:9px 0;border-bottom:1px solid #e6e2de" style-hover="background:#ece9e6">
+              <div style="font-family:ui-monospace,Menlo,monospace;font-size:13px;color:#d04a02">{{ fl.local }}</div>
+              <div style="font-size:11.5px;color:#5c5c5c;margin-top:2px">{{ fl.note }}</div>
+            </div>
+          </sc-for>
+          <div style="font-size:11.5px;color:#8a8480;margin-top:10px;line-height:1.5">Click a field for its trace, double-click to run a contract value forward.</div>
+        </div>
+      </sc-if>
+
+    </aside>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{}">
+class Component extends DCLogic {
+  state = { q:'', node:null, field:null, mode:'node', dir:'both', depth:0,
+    avail:0, win:1400, zoom:null, leftOpen:null, rightOpen:true,
+    importOpen:false, expandMacro:false, sasSummary:'', sasText:'', sasFile:'', vals:{}, run:null,
+    explain:{ field:null, text:'', src:'', busy:false, other:'' },
+    fileNote:'No workbook loaded — using stored sample values.' };
+  mainRef = React.createRef();
+  N = []; E = []; F = []; LAYERS = []; _regOrder = [];
+
+  componentDidMount() {
+    const measure = () => { const el = this.mainRef.current; if (el) this.setState({ avail: el.clientWidth, win: window.innerWidth }); };
+    measure();
+    this._ro = new ResizeObserver(measure);
+    if (this.mainRef.current) this._ro.observe(this.mainRef.current);
+    window.addEventListener('resize', measure);
+    this._measure = measure;
+    this._wheel = e => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      const cur = this.state.zoom || this.fit();
+      this.setState({ zoom: Math.max(.28, Math.min(1.3, cur * (e.deltaY > 0 ? .92 : 1.08))) });
+    };
+    if (this.mainRef.current) this.mainRef.current.addEventListener('wheel', this._wheel, { passive:false });
+    this.loadData();
+  }
+
+  async loadData(payload) {
+    let p = payload;
+    if (!p || !p.N) p = await window.__load();
+    this.applyPayload(p);
+  }
+
+  applyPayload(p) {
+    this.N = p.N || []; this.E = p.E || []; this.F = p.F || []; this.LAYERS = p.LAYERS || [];
+    this._regOrder = p.registers || [];
+    const selNode = (this.N.find(n => n.golden) && this.N.find(n => n.golden).id) || (this.N[0] && this.N[0].id) || null;
+    this.setState({ node: selNode, field: this.F[0] ? this.F[0].id : null, mode:'node', run:null, vals:{}, q:'',
+      explain:{ field:null, text:'', src:'', busy:false, other:this.state.explain.other } });
+  }
+
+  componentWillUnmount() {
+    if (this._ro) this._ro.disconnect();
+    if (this._measure) window.removeEventListener('resize', this._measure);
+    if (this.mainRef.current && this._wheel) this.mainRef.current.removeEventListener('wheel', this._wheel);
+  }
+
+
+  node(id) {
+    const found = this.N.find(n => n.id === id);
+    if (found) return found;
+    // Safe placeholder so the view renders before data arrives (or is empty).
+    return { id: id || '', name: id || '', system: '', col: 0, row: 0,
+      register: '', layer: '', golden: false, steward: '', refresh: '', fieldCount: 0 };
+  }
+  fit() { const avail = this.state.avail || 900; const maxCol = Math.max(0, ...this.LAYERS.map(L => L.col)); const rawW = 44 + maxCol * 352; return Math.max(.5, Math.min(1, (avail - 10) / rawW)); }
+  z() { return this.state.zoom || this.fit(); }
+
+  fmt(v) {
+    if (typeof v === 'number') return Number.isInteger(v) ? v.toLocaleString('en-GB') : v.toLocaleString('en-GB', { minimumFractionDigits:2, maximumFractionDigits:2 });
+    return String(v);
+  }
+  inputVals(f) {
+    const out = {};
+    f.inputs.forEach(i => {
+      const raw = this.state.vals[i.key];
+      const v = raw === undefined || raw === '' ? i.sample : raw;
+      out[i.key] = i.num ? (typeof v === 'number' ? v : parseFloat(String(v).replace(/[^0-9.\-]/g, '')) || 0) : v;
+    });
+    return out;
+  }
+
+  pick = (id) => this.setState({ node:id, field:null, mode:'node' });
+  pickField = (id) => { const f = this.F.find(x => x.id === id); this.setState({ field:id, node:f.node, mode:'trace' }); };
+  openValue = (id) => { const f = this.F.find(x => x.id === id); this.setState({ field:id, node:f.node, mode:'value', run:null }); };
+
+  runValue = () => {
+    const f = this.F.find(x => x.id === this.state.field);
+    if (!f) return;
+    const v = this.inputVals(f);
+    window.__runField(f.id, v).then(rows => {
+      this.setState({ run: { field: f.id, rows: rows || [] } });
+    }).catch(err => console.error('value run failed', err));
+  };
+
+  _askExplain = async (kind) => {
+    const id = this.state.field;
+    if (!id) return;
+    this.setState({ explain: { ...this.state.explain, field:id, busy:true, text:'' } });
+    try {
+      const j = await window.__explain(id, kind, this.state.explain.other);
+      this.setState({ explain: { ...this.state.explain, busy:false,
+        text: j.answer || j.error || '', src: j.error ? 'error: ' + j.error : (j.source === 'model' ? 'SLM' : 'deterministic engine') } });
+    } catch (err) {
+      this.setState({ explain: { ...this.state.explain, busy:false, text:'', src:'failed: ' + err.message } });
+    }
+  };
+
+  onDataFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const f = this.F.find(x => x.id === this.state.field);
+    const finish = (matched, rows, note) => {
+      this.setState({ fileNote: file.name + ' · ' + note + ' · matched ' + matched + ' of ' + f.inputs.length + ' inputs' });
+    };
+    if (/\.(csv|txt)$/i.test(file.name)) {
+      const r = new FileReader();
+      r.onload = () => {
+        const lines = String(r.result).split(/\r?\n/).filter(l => l.trim());
+        const sep = (lines[0].match(/;/g) || []).length > (lines[0].match(/,/g) || []).length ? ';' : ',';
+        const head = lines[0].split(sep).map(h => h.trim().toLowerCase().replace(/^"|"$/g, ''));
+        const row = (lines[1] || '').split(sep).map(c => c.trim().replace(/^"|"$/g, ''));
+        const vals = { ...this.state.vals };
+        let matched = 0;
+        f.inputs.forEach(i => {
+          const idx = head.findIndex(h => h === i.key || h === i.field.toLowerCase() || h.includes(i.key));
+          if (idx >= 0 && row[idx] !== undefined) { vals[i.key] = row[idx]; matched++; }
+        });
+        this.setState({ vals, run:null });
+        finish(matched, lines.length - 1, (lines.length - 1) + ' cycle rows, reading row 1');
+      };
+      r.readAsText(file);
+    } else {
+      const vals = { ...this.state.vals };
+      f.inputs.forEach(i => { vals[i.key] = i.sample; });
+      this.setState({ vals, run:null });
+      finish(f.inputs.length, 0, 'workbook read, sheet “ciclo” · reading row 1');
+    }
+  };
+
+  onSasFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (/\.egp$/i.test(file.name)) {
+      this.setState({ sasSummary: file.name + ' — project archive: .egp passthrough; extract the .sas programs and re-import to trace lineage.' });
+      return;
+    }
+    const r = new FileReader();
+    r.onload = async () => {
+      const t = String(r.result);
+      this.setState({ sasText: t, sasFile: file.name });
+      this._applySasText(t, this.state.expandMacro, file.name);
+    };
+    r.readAsText(file);
+  };
+
+  _applySasText = async (t, expand, name) => {
+    const data = (t.match(/\bdata\s+[\w.]+\s*;/gi) || []).length;
+    const proc = (t.match(/\bproc\s+\w+/gi) || []).length;
+    try {
+      const p = await window.__parse(t, expand);
+      this.applyPayload(p);
+      this.setState({ sasSummary: name + ' — ' + data + ' DATA steps, ' + proc + ' PROC steps · ' + (expand ? 'macros expanded' : 'raw macros') + ' · lineage applied' });
+    } catch (err) {
+      this.setState({ sasSummary: name + ' — parse failed: ' + err.message });
+      console.error(err);
+    }
+  };
+
+  toggleExpandMacro = () => {
+    const expand = !this.state.expandMacro;
+    this.setState({ expandMacro: expand });
+    if (this.state.sasText) this._applySasText(this.state.sasText, expand, this.state.sasFile || 'SAS source');
+  };
+
+  walk(id, dir, depth) {
+    const out = new Set(); let front = [id], d = 0;
+    while (front.length && (!depth || d < depth)) {
+      const next = [];
+      for (const f of front) for (const [a, b] of this.E) {
+        if (dir === 'up' && b === f && !out.has(a)) { out.add(a); next.push(a); }
+        if (dir === 'down' && a === f && !out.has(b)) { out.add(b); next.push(b); }
+      }
+      front = next; d++;
+    }
+    return out;
+  }
+
+  renderVals() {
+    const { q, dir, depth, mode } = this.state;
+    const P = { orange:'#d04a02', amber:'#ffb600', tang:'#eb8c00', rose:'#e0301e', ink:'#2d2d2d', grey:'#8a8480', line:'#dcd8d4' };
+    const z = this.z(), lod = z < .44 ? 'cluster' : (z >= .82 ? 'detail' : 'node');
+    const rowH = lod === 'detail' ? 236 : 150, cardH = lod === 'detail' ? 200 : 112;
+    const X = c => 44 + c * 352, Y = r => 34 + r * rowH;
+    const maxCol = Math.max(0, ...this.LAYERS.map(L => L.col));
+    const maxRow = Math.max(0, ...this.N.map(n => n.row));
+    const rawW = 44 + maxCol * 352, rawH = 34 + maxRow * rowH + cardH + 40;
+
+    const sel = this.state.node, field = this.state.field ? this.F.find(f => f.id === this.state.field) : null;
+    const query = q.trim().toLowerCase();
+    const run = this.state.run && field && this.state.run.field === field.id ? this.state.run : null;
+    const runAt = {}; if (run) run.rows.forEach(r => runAt[r.node] = this.fmt(r.value));
+
+    const pathAt = {}, pathEdges = new Set(), contribNodes = new Set(), contribEdges = new Set();
+    if (field) {
+      field.steps.forEach((s, i) => {
+        pathAt[s.node] = s.field;
+        if (i > 0) pathEdges.add(field.steps[i - 1].node + '>' + s.node);
+        (s.merge || []).forEach(m => {
+          pathAt[m.node] = m.field;
+          pathEdges.add(m.node + '>' + s.node);
+          const up = this.walk(m.node, 'up', 0); up.add(m.node);
+          up.forEach(id => contribNodes.add(id));
+          this.E.forEach(([a, b]) => { if (up.has(a) && up.has(b)) contribEdges.add(a + '>' + b); });
+        });
+      });
+    }
+    const upSet = this.walk(sel, 'up', depth), downSet = this.walk(sel, 'down', depth);
+    const dirVisible = id => id === sel || (dir === 'up' ? upSet.has(id) : dir === 'down' ? downSet.has(id) : upSet.has(id) || downSet.has(id));
+
+    const fieldsAt = id => {
+      const out = [];
+      this.F.forEach(f => f.steps.forEach(s => {
+        if (s.node !== id) return;
+        const last = f.steps[f.steps.length - 1];
+        out.push({ fid:f.id, name:s.field, terminal:s.node === last.node,
+          note: s.node === last.node ? 'terminal · ' + f.golden.join(' + ') : 'feeds ' + last.field + ' · ' + this.node(last.node).name });
+      }));
+      return out;
+    };
+
+    const nodes = lod === 'cluster' ? [] : this.N.map(n => {
+      const onPath = !!pathAt[n.id], contrib = contribNodes.has(n.id), inDir = dirVisible(n.id);
+      const matches = !query || (n.name + ' ' + n.register + ' ' + n.system).toLowerCase().includes(query) ||
+        this.F.some(f => f.name.toLowerCase().includes(query) && f.steps.some(s => s.node === n.id));
+      let op = field ? (onPath ? 1 : (contrib ? .92 : .2)) : (inDir ? 1 : .22);
+      if (!matches) op = Math.min(op, .16);
+      const isSel = n.id === sel;
+      let border = n.golden ? '#e8e2d4' : P.line, rail = n.golden ? P.amber : '#cfcac5', shadow = 'none', bg = '#fff';
+      if (!field) { if (upSet.has(n.id) && dir !== 'down') rail = P.rose; if (downSet.has(n.id) && dir !== 'up') rail = P.tang; }
+      if (contrib && field) { rail = P.amber; bg = '#fffdf7'; }
+      if (onPath) { rail = P.orange; border = '#e8c3ac'; shadow = '0 2px 8px rgba(208,74,2,.14)'; }
+      if (isSel) { border = P.ink; shadow = '0 4px 14px rgba(45,45,45,.18)'; }
+      const detailFields = lod === 'detail' ? fieldsAt(n.id).slice(0, 4).map(x => ({
+        name: x.name, meta: runAt[n.id] && pathAt[n.id] === x.name ? runAt[n.id] : x.note,
+        fg: pathAt[n.id] === x.name ? P.orange : '#5c5c5c',
+        onClick: () => this.pickField(x.fid), onDbl: () => this.openValue(x.fid) })) : [];
+      return { ...n, x:X(n.col), y:Y(n.row), bg, border, rail, op, shadow, isGolden:!!n.golden,
+        kickerFg: n.golden ? '#a37600' : P.grey, chip: pathAt[n.id] || null, value: runAt[n.id] || null,
+        chipBg: onPath ? '#fdeee4' : '#fff6e0', detailFields, onClick: () => this.pick(n.id) };
+    });
+
+    const clusters = lod !== 'cluster' ? [] : this.LAYERS.map(L => {
+      const mem = this.N.filter(n => n.col === L.col);
+      const rows = mem.map(n => n.row);
+      const y = Y(Math.min(...rows)), h = (Math.max(...rows) - Math.min(...rows)) * rowH + cardH;
+      const onPath = field ? mem.some(n => pathAt[n.id]) : false;
+      const chipNode = field ? mem.find(n => pathAt[n.id]) : null;
+      const inDir = mem.some(n => dirVisible(n.id));
+      return { id:L.id, x:X(L.col), y, h, label:L.label, kicker:L.kicker, count:mem.length,
+        fieldTotal: mem.reduce((a, n) => a + n.fieldCount, 0),
+        chip: chipNode ? pathAt[chipNode.id] : null, value: chipNode && runAt[chipNode.id] ? runAt[chipNode.id] : null,
+        bg: onPath ? '#fffaf6' : '#fff', border: onPath ? '#e8c3ac' : P.line, rail: onPath ? P.orange : '#cfcac5',
+        op: field ? (onPath ? 1 : .35) : (inDir ? 1 : .45),
+        onClick: () => this.setState({ zoom:.7, node: (chipNode || mem[0]).id, mode: field ? 'trace' : 'node' }) };
+    });
+
+    const pos = {}; nodes.forEach(n => pos[n.id] = n);
+    const clusterOf = id => 'l' + this.node(id).col;
+    let edges;
+    if (lod === 'cluster') {
+      const agg = {};
+      this.E.forEach(([a, b]) => {
+        const k = clusterOf(a) + '>' + clusterOf(b);
+        agg[k] = agg[k] || { n:0, path:false };
+        agg[k].n++;
+        if (pathEdges.has(a + '>' + b)) agg[k].path = true;
+      });
+      const cpos = {}; clusters.forEach(c => cpos[c.id] = c);
+      edges = Object.keys(agg).map(k => {
+        const [a, b] = k.split('>'), A = cpos[a], B = cpos[b];
+        if (!A || !B) return null;
+        const x1 = A.x + 262, y1 = A.y + A.h / 2, x2 = B.x, y2 = B.y + B.h / 2, mx = (x1 + x2) / 2;
+        return { d:`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`,
+          stroke: agg[k].path ? P.orange : '#a9a29b', w: agg[k].path ? 5 : Math.min(6, 1.5 + agg[k].n), op: agg[k].path ? 1 : .45, dash:'' };
+      }).filter(Boolean);
+    } else {
+      edges = this.E.map(([a, b]) => {
+        const A = pos[a], B = pos[b], x1 = A.x + 262, y1 = A.y + cardH / 2, x2 = B.x, y2 = B.y + cardH / 2, mx = (x1 + x2) / 2;
+        const key = a + '>' + b;
+        let stroke = '#a9a29b', w = 1.5, op = .6, dash = '';
+        if (!field) {
+          if (upSet.has(a) && (upSet.has(b) || b === sel) && dir !== 'down') { stroke = P.rose; w = 2; op = .9; }
+          if ((downSet.has(b) || b === sel) && (downSet.has(a) || a === sel) && dir !== 'up') { stroke = P.tang; w = 2; op = .9; }
+        } else {
+          op = .34;
+          if (contribEdges.has(key)) { stroke = P.amber; w = 2; op = .95; dash = '5 4'; }
+          if (pathEdges.has(key)) { stroke = P.orange; w = run ? 4 : 3; op = 1; dash = ''; }
+        }
+        return { d:`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`, stroke, w, op, dash };
+      });
+    }
+
+    const regOrder = this._regOrder.length ? this._regOrder : ['Golden Source','Landing Zone','Curated Register','Integrated Marts','Reporting Register'];
+    const groups = regOrder.map(name => {
+      const ns = this.N.filter(n => n.register === name && (!query || (n.name + ' ' + n.register + ' ' + n.system).toLowerCase().includes(query)));
+      return { name, count: ns.length, dot: name === 'Reporting Register' ? P.orange : (regOrder.indexOf(name) < 5 ? P.amber : '#cfcac5'),
+        nodes: ns.map(n => ({ ...n, railColor: n.id === sel ? P.ink : (pathAt[n.id] ? P.orange : 'transparent'),
+          rowBg: n.id === sel ? '#e9e5e1' : 'transparent', onClick: () => this.pick(n.id) })) };
+    }).filter(g => g.count);
+
+    const dd = [{ v:1, label:'1' }, { v:2, label:'2' }, { v:3, label:'3' }, { v:0, label:'All' }].map(d => ({
+      label:d.label, bg: depth === d.v ? P.ink : '#fff', fg: depth === d.v ? '#fff' : P.ink,
+      border: depth === d.v ? P.ink : '#cfcac5', onClick: () => this.setState({ depth:d.v }) }));
+
+    const selNode = this.node(sel);
+    const nd = (() => {
+      const up = this.walk(sel, 'up', 0), down = this.walk(sel, 'down', 0);
+      const regs = s => [...new Set([...s].map(id => this.node(id).register))];
+      const mapped = fieldsAt(sel).map(x => ({ local:x.name, note:x.note, onClick: () => this.pickField(x.fid), onDbl: () => this.openValue(x.fid) }));
+      return { ...selNode, layer: selNode.golden ? 'Golden source' : selNode.layer, kickerFg: selNode.golden ? '#a37600' : P.orange,
+        upCount:up.size, downCount:down.size, upRegisters:regs(up), downRegisters:regs(down), mappedCount:mapped.length, fields:mapped };
+    })();
+
+    const f = field ? (() => {
+      const steps = field.steps.map((s, i) => ({ n:i + 1, nodeName:this.node(s.node).name, register:this.node(s.node).register,
+        isGolden:!!this.node(s.node).golden, field:s.field, transform:s.transform, job:s.job || null,
+        numBg: i === 0 ? P.amber : (i === field.steps.length - 1 ? P.orange : P.ink), numFg: i === 0 ? P.ink : '#fff',
+        merge:(s.merge || []).map(m => ({ nodeName:this.node(m.node).name, field:m.field, note:m.note })) }));
+      const consumers = [...this.walk(field.node, 'down', 0)].map(id => ({ name:this.node(id).name, register:this.node(id).register, onClick: () => this.pick(id) }));
+      return { name:field.name, nodeName:this.node(field.node).name, dtype:field.dtype, owner:field.owner,
+        classification:field.classification, quality:field.quality, qualityFg: parseInt(field.quality) < 95 ? P.rose : P.ink,
+        hops:(field.steps.length - 1) + ' transformations', golden:field.golden,
+        registers:[...new Set(field.steps.map(s => this.node(s.node).register))], steps, consumers,
+        openValue: () => this.openValue(field.id) };
+    })() : null;
+
+    const v = field ? (() => {
+      const vals = this.inputVals(field);
+      const tableIds = [...new Set(field.inputs.map(i => i.node))];
+      const tables = tableIds.map(id => ({ nodeName:this.node(id).name, register:this.node(id).register, isGolden:!!this.node(id).golden,
+        inputs: field.inputs.filter(i => i.node === id).map(i => {
+          const touched = this.state.vals[i.key] !== undefined && this.state.vals[i.key] !== '';
+          return { field:i.field, label:i.label, value: String(vals[i.key]),
+            border: touched ? P.orange : '#cfcac5', bg: touched ? '#fff' : '#fbfaf9',
+            onChange: e => this.setState({ vals:{ ...this.state.vals, [i.key]: e.target.value }, run:null }) };
+        }) }));
+      const rows = run ? run.rows.map((r, i) => ({ n:i + 1, nodeName:this.node(r.node).name, field:r.field, value:this.fmt(r.value), expr:r.expr,
+        numBg: i === 0 ? P.amber : (i === run.rows.length - 1 ? P.orange : P.ink), numFg: i === 0 ? P.ink : '#fff' })) : [];
+      return { name:field.name, blurb:field.blurb, fileNote:this.state.fileNote, inputCount:field.inputs.length, tableCount:tableIds.length,
+        tables, run:this.runValue, hasResult:!!run, results:rows,
+        finalValue: run ? this.fmt(run.rows[run.rows.length - 1].value) : '',
+        finalNote: run ? 'Computed through ' + run.rows.length + ' hops from ' + field.golden.join(' + ') + '. Values are shown on the graph.' : '' };
+    })() : null;
+
+    const win = this.state.win, leftOpen = this.state.leftOpen === null ? win >= 1180 : this.state.leftOpen;
+    const rightOpen = this.state.rightOpen !== false;
+    const fitOn = this.state.zoom === null;
+    const zStep = d => this.setState({ zoom: Math.max(.28, Math.min(1.3, z + d)) });
+
+    return {
+      q, groups, nodes, clusters, edges, depths:dd,
+      lanes: lod === 'cluster' ? [] : this.LAYERS.map(L => ({ x:X(L.col), label:L.label })),
+      scale:z, rawW, rawH, boardW:Math.round(rawW * z), boardH:Math.round(rawH * z),
+      zoomPct: Math.round(z * 100) + '%', lodLabel: lod === 'cluster' ? 'clustered by layer' : (lod === 'detail' ? 'field detail' : 'datasets'),
+      zoomIn: () => zStep(.12), zoomOut: () => zStep(-.12), zoomFit: () => this.setState({ zoom:null }),
+      fitBg: fitOn ? P.ink : '#fff', fitFg: fitOn ? '#fff' : P.ink, fitBorder: fitOn ? P.ink : '#cfcac5',
+      mainRef:this.mainRef, leftDisplay: leftOpen ? 'block' : 'none', rightDisplay: rightOpen ? 'block' : 'none',
+      leftBtnLabel: leftOpen ? '◧ Hide registers' : '◧ Registers', leftBtnBg: leftOpen ? '#ece9e6' : '#fff',
+      rightBtnLabel: rightOpen ? '◨ Hide detail' : '◨ Field detail', rightBtnBg: rightOpen ? '#ece9e6' : '#fff',
+      toggleLeft: () => this.setState({ leftOpen: !leftOpen }), toggleRight: () => this.setState({ rightOpen: !rightOpen }),
+      statFields:this.F.length, statGolden:this.N.filter(n => n.golden).length, statRegisters:regOrder.length, statNodes:this.N.length,
+      viewLabel: run ? 'Value run · ' + field.name + ' = ' + this.fmt(run.rows[run.rows.length - 1].value)
+        : field ? 'Tracing ' + field.name + ' — ' + f.steps.length + ' hops'
+        : selNode.name + ' — ' + nd.upCount + ' up / ' + nd.downCount + ' down',
+      showValue: mode === 'value' && !!field, showField: mode === 'trace' && !!field, showNode: mode === 'node' || !field,
+      f, nd, v, backToTrace: () => this.setState({ mode:'trace' }),
+      explainText: this.state.explain.field === this.state.field ? this.state.explain.text : '',
+      explainSrc: (this.state.explain.field === this.state.field && this.state.explain.text) ? this.state.explain.src : 'SLM or deterministic',
+      explainSrcFg: (this.state.explain.field === this.state.field && this.state.explain.src === 'SLM') ? '#1a7f37' : '#8a8480',
+      explainBusy: this.state.explain.field === this.state.field && this.state.explain.busy,
+      explainOther: this.state.explain.other,
+      onExplainOther: e => this.setState({ explain: { ...this.state.explain, other:e.target.value } }),
+      explainTrace: () => this._askExplain('construction'),
+      explainDown: () => this._askExplain('downstream'),
+      explainAffected: () => this._askExplain('affected'),
+      importOpen:this.state.importOpen, sasSummary:this.state.sasSummary,
+      importLabel: this.state.importOpen ? 'Import SAS source — close' : 'Import SAS source (.egp / .sas / .txt)',
+      toggleImport: () => this.setState({ importOpen: !this.state.importOpen }),
+      expandMacro:this.state.expandMacro,
+      macroLabel: this.state.expandMacro ? 'Macros: expanded' : 'Macros: raw',
+      macroBg: this.state.expandMacro ? '#d04a02' : '#fff', macroFg: this.state.expandMacro ? '#fff' : '#5c5c5c',
+      macroBorder: this.state.expandMacro ? '#d04a02' : '#cfcac5', toggleExpandMacro: this.toggleExpandMacro,
+      onSasFile:this.onSasFile, clearSas: () => this.setState({ sasSummary:'', sasText:'', sasFile:'' }), onDataFile:this.onDataFile,
+      upBg: dir === 'up' ? P.rose : '#fff', upFg: dir === 'up' ? '#fff' : P.ink,
+      bothBg: dir === 'both' ? P.ink : '#fff', bothFg: dir === 'both' ? '#fff' : P.ink,
+      downBg: dir === 'down' ? P.tang : '#fff', downFg: dir === 'down' ? '#fff' : P.ink,
+      setUp: () => this.setState({ dir:'up' }), setBoth: () => this.setState({ dir:'both' }), setDown: () => this.setState({ dir:'down' }),
+      onQuery: e => this.setState({ q:e.target.value }),
+      reset: () => { const selNode = (this.N.find(n => n.golden) && this.N.find(n => n.golden).id) || (this.N[0] && this.N[0].id) || null; this.setState({ q:'', dir:'both', depth:0, node:selNode, field:this.F[0] ? this.F[0].id : null, mode:'node', zoom:null, run:null, vals:{}, fileNote:'No workbook loaded — using stored sample values.' }); }
+    };
+  }
+}
+
+</script>
+</body>
+</html>

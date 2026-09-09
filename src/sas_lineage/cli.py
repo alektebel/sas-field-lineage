@@ -56,6 +56,18 @@ def main():
         help='Output file for results (JSON format)'
     )
     
+    parser.add_argument(
+        '--expand-macros',
+        action='store_true',
+        help='Expand the supported deterministic %macro subset before parsing'
+    )
+
+    parser.add_argument(
+        '--include-base',
+        type=str,
+        help='Sandbox directory for %include (requires --expand-macros; reads below this directory only)'
+    )
+
     args = parser.parse_args()
     
     # Read SAS file
@@ -69,8 +81,10 @@ def main():
     
     # Parse SAS code
     print(f"Parsing {args.sas_file}...")
+    expand = args.expand_macros or bool(args.include_base)
+    include_base = args.include_base if expand else None
     parser_obj = SASParser()
-    program = parser_obj.parse(sas_code)
+    program = parser_obj.parse(sas_code, expand_macros=expand, include_base=include_base)
     tracker = LineageTracker(program)
     
     print(f"Found {len(program.get_all_fields())} fields in {len(program.data_steps)} data steps")
