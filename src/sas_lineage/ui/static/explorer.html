@@ -51,6 +51,15 @@
     if (!r.ok) throw new Error("explain failed: " + r.status);
     return await r.json();
   };
+  window.__tablesXlsx = async function (code) {
+    var r = await fetch("/api/tables.xlsx", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: code || "" })
+    });
+    if (!r.ok) throw new Error("tables export failed: " + r.status);
+    return await r.blob();
+  };
 </script>
 <x-dc>
 <helmet>
@@ -125,6 +134,11 @@
           <button onClick="{{ clearSas }}" style="font-family:inherit;font-size:11.5px;border:0;background:none;color:#d04a02;cursor:pointer;text-decoration:underline">discard</button>
         </sc-if>
       </span>
+    </sc-if>
+    <button onClick="{{ downloadTables }}" style="font-family:inherit;font-size:11.5px;padding:4px 10px;border:1px solid #d04a02;background:#fff;color:#d04a02;cursor:pointer;white-space:nowrap" style-hover="background:#d04a02;color:#fff" title="Download every table written to a persistent (non-WORK) SAS library as an .xlsx report; %let/&macro names, prefixes and loops are resolved first">Download persistent tables (.xlsx)</button>
+    <span style="color:#2d2d2d">{{ tablesNote }}</span>
+    <sc-if value="{{ warnLabel }}" hint-placeholder-val="{{ '' }}">
+      <span style="color:#e0301e;cursor:help;white-space:nowrap" title="{{ warnText }}">{{ warnLabel }}</span>
     </sc-if>
     <span style="margin-left:auto;white-space:nowrap">Double-click a field to run values through the graph · ⌘/Ctrl + scroll to zoom</span>
   </div>
@@ -418,6 +432,7 @@ class Component extends DCLogic {
     avail:0, win:1400, zoom:null, leftOpen:null, rightOpen:true,
     importOpen:false, expandMacro:false, sasSummary:'', sasText:'', sasFile:'', vals:{}, run:null,
     explain:{ field:null, text:'', src:'', busy:false, other:'' },
+    tablesNote:'', warnings:[],
     fileNote:'No workbook loaded — using stored sample values.' };
   mainRef = React.createRef();
   N = []; E = []; F = []; LAYERS = []; _regOrder = [];
@@ -449,7 +464,8 @@ class Component extends DCLogic {
     this.N = p.N || []; this.E = p.E || []; this.F = p.F || []; this.LAYERS = p.LAYERS || [];
     this._regOrder = p.registers || [];
     const selNode = (this.N.find(n => n.golden) && this.N.find(n => n.golden).id) || (this.N[0] && this.N[0].id) || null;
-    this.setState({ node: selNode, field: this.F[0] ? this.F[0].id : null, mode:'node', run:null, vals:{}, q:'',
+    this.setState({ node: selNode, field:this.F[0] ? this.F[0].id : null, mode:'node', run:null, vals:{}, q:'',
+      warnings: p.warnings || [],
       explain:{ field:null, text:'', src:'', busy:false, other:this.state.explain.other } });
   }
 
@@ -564,7 +580,8 @@ class Component extends DCLogic {
     try {
       const p = await window.__parse(t, expand);
       this.applyPayload(p);
-      this.setState({ sasSummary: name + ' — ' + data + ' DATA steps, ' + proc + ' PROC steps · ' + (expand ? 'macros expanded' : 'raw macros') + ' · lineage applied' });
+      const wc = (p.warnings || []).length;
+      this.setState({ sasSummary: name + ' — ' + data + ' DATA steps, ' + proc + ' PROC steps · ' + (expand ? 'macros expanded' : 'raw macros') + (wc ? ' · ⚠ ' + wc + ' parser warning' + (wc === 1 ? '' : 's') : '') + ' · lineage applied' });
     } catch (err) {
       this.setState({ sasSummary: name + ' — parse failed: ' + err.message });
       console.error(err);
@@ -575,6 +592,18 @@ class Component extends DCLogic {
     const expand = !this.state.expandMacro;
     this.setState({ expandMacro: expand });
     if (this.state.sasText) this._applySasText(this.state.sasText, expand, this.state.sasFile || 'SAS source');
+  };
+
+  downloadTables = () => {
+    this.setState({ tablesNote:'Building persistent-library report…' });
+    window.__tablesXlsx(this.state.sasText || '').then(blob => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'persistent_library_tables.xlsx';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      this.setState({ tablesNote:'Downloaded persistent-library tables (.xlsx)' });
+    }).catch(err => this.setState({ tablesNote:'Export failed: ' + err.message }));
   };
 
   walk(id, dir, depth) {
@@ -795,7 +824,10 @@ class Component extends DCLogic {
       macroLabel: this.state.expandMacro ? 'Macros: expanded' : 'Macros: raw',
       macroBg: this.state.expandMacro ? '#d04a02' : '#fff', macroFg: this.state.expandMacro ? '#fff' : '#5c5c5c',
       macroBorder: this.state.expandMacro ? '#d04a02' : '#cfcac5', toggleExpandMacro: this.toggleExpandMacro,
-      onSasFile:this.onSasFile, clearSas: () => this.setState({ sasSummary:'', sasText:'', sasFile:'' }), onDataFile:this.onDataFile,
+      downloadTables: this.downloadTables, tablesNote: this.state.tablesNote,
+      warnLabel: this.state.warnings.length ? ('⚠ ' + this.state.warnings.length + ' parser warning' + (this.state.warnings.length === 1 ? '' : 's') + ' — lineage may be incomplete') : '',
+      warnText: this.state.warnings.slice(0, 12).map(w => 'line ' + (w.line || '?') + ': ' + w.message).join('\n'),
+      onSasFile:this.onSasFile, clearSas: () => this.setState({ sasSummary:'', sasText:'', sasFile:'', tablesNote:'', warnings:[] }), onDataFile:this.onDataFile,
       upBg: dir === 'up' ? P.rose : '#fff', upFg: dir === 'up' ? '#fff' : P.ink,
       bothBg: dir === 'both' ? P.ink : '#fff', bothFg: dir === 'both' ? '#fff' : P.ink,
       downBg: dir === 'down' ? P.tang : '#fff', downFg: dir === 'down' ? '#fff' : P.ink,

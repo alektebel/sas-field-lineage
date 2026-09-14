@@ -106,5 +106,57 @@ class TestFieldDependencies(unittest.TestCase):
         self.assertTrue(len(discount_field.dependencies) > 0)
 
 
+class TestParseWarnings(unittest.TestCase):
+
+    def setUp(self):
+        self.parser = SASParser()
+
+    def _kinds(self, code):
+        return {w["kind"] for w in self.parser.parse(code).get_warnings()}
+
+    def test_clean_program_has_no_warnings(self):
+        code = "data out; set src; x = y * 2; run;\n"
+        self.assertEqual(self.parser.parse(code).get_warnings(), [])
+
+    def test_benign_top_level_statements_do_not_warn(self):
+        code = "libname mrt '/x';\noptions validvarname=any;\ntitle 't';\nrun;\n"
+        self.assertEqual(self.parser.parse(code).get_warnings(), [])
+
+    def test_unsupported_data_statement_warns(self):
+        code = "data out; set src; drop temp; x = 1; run;\n"
+        warnings = self.parser.parse(code).get_warnings()
+        self.assertIn("unsupported", {w["kind"] for w in warnings})
+        self.assertTrue(any("drop temp" in w["message"] for w in warnings))
+
+    def test_unterminated_step_warns(self):
+        code = "data out; set src; x = 1;\n"
+        kinds = self._kinds(code)
+        self.assertIn("unterminated", kinds)
+
+    def test_missing_terminator_before_next_step_warns(self):
+        code = "data a; set x; v = 1;\ndata b; set a; w = 2; run;\n"
+        warnings = self.parser.parse(code).get_warnings()
+        self.assertTrue(any(w["kind"] == "unterminated" for w in warnings))
+        # the following step is still parsed
+        self.assertEqual([d.output_table for d in self.parser.parse(code).data_steps], ["a", "b"])
+
+    def test_two_level_name_warns(self):
+        code = "data mrt.out; set mrt.src; x = 1; run;\n"
+        warnings = self.parser.parse(code).get_warnings()
+        self.assertTrue(any(w["kind"] == "two-level-name" for w in warnings))
+
+    def test_unknown_top_level_statement_warns(self):
+        code = "FOOBAR something;\ndata out; set src; x = 1; run;\n"
+        kinds = self._kinds(code)
+        self.assertIn("unknown-statement", kinds)
+
+    def test_repeated_unsupported_statement_is_deduplicated(self):
+        body = "".join(f"drop t{i};\n" for i in range(50))
+        code = "data out; set src;\n" + body + "run;\n"
+        unsupported = [w for w in self.parser.parse(code).get_warnings()
+                       if w["kind"] == "unsupported"]
+        self.assertEqual(len(unsupported), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -107,6 +107,22 @@ class SASProgram:
         self.data_steps: List[DataStepNode] = []
         self.proc_steps: List[ProcStepNode] = []
         self.all_fields: Dict[str, List[FieldNode]] = {}  # field_name -> [FieldNode instances]
+        # Non-fatal parse issues: statements the parser could not fully model.
+        self.warnings: List[Dict[str, Any]] = []
+
+    def add_warning(self, message: str, line: Optional[int] = None,
+                    statement: Optional[str] = None, kind: str = "parse") -> None:
+        """Record a parse warning so callers can surface incomplete lineage."""
+        self.warnings.append({
+            "message": message,
+            "line": line,
+            "statement": statement,
+            "kind": kind,
+        })
+
+    def get_warnings(self) -> List[Dict[str, Any]]:
+        """Return the accumulated parse warnings."""
+        return list(self.warnings)
     
     def add_data_step(self, data_step: DataStepNode):
         """Add a data step to the program"""

@@ -8,6 +8,12 @@ GET  /             -> explorer.html (the web app)
 GET  /api/demo     -> payload for the bundled demo SAS program
 POST /api/parse    -> {"code": "...", "expand_macros": false} -> payload for that SAS program
 POST /api/run      -> {"field": "table.name", "vals": {...}} -> per-hop value rows
+GET  /api/tables   -> persistent-library table inventory for the last parsed program
+POST /api/tables   -> {"code": "..."} -> persistent-library table inventory
+GET  /api/tables.xlsx  -> download that report as a workbook
+POST /api/tables.xlsx  -> {"code": "..."} -> download that report as a workbook
+                      (macros/prefixes always resolved; unresolved names and
+                       parser warnings are included)
 POST /api/explain  -> {"field": "table.name", "kind": "construction|downstream|affected",
                        "other": "table.name"} -> {answer, source, question, packet}
                        (source: "model" if the SLM service answered within the fact
@@ -23,6 +29,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import mimetypes
 import os
@@ -36,6 +43,8 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from ..parser import SASParser
+from ..parser.preprocessor import expand_for_report
+from ..report import build_inventory, inventory_sheets, write_xlsx
 from .facts import FieldFacts, SYSTEM_PROMPT, make_question, user_message
 from .payload import build_payload, ProgramIndex
 from .trace import run_field_trace
@@ -72,6 +81,8 @@ _lock = threading.Lock()
 _program = None
 _index: ProgramIndex | None = None
 _facts: Optional[FieldFacts] = None
+_last_code: str = ""
+_last_expand: bool = False
 _rng = random.Random(17)
 SLM_URL = os.environ.get("SLM_URL", "http://127.0.0.1:8020")
 _FIELD_TOKEN_RE = re.compile(r"[A-Za-z_]\w*\.[A-Za-z_]\w*")
@@ -88,12 +99,38 @@ def _demo_code() -> str:
 
 
 def _parse(code: str, expand_macros: bool = False) -> Dict[str, Any]:
-    global _program, _index, _facts
+    global _program, _index, _facts, _last_code, _last_expand
     with _lock:
+        _last_code = code
+        _last_expand = expand_macros
         _program = SASParser().parse(code, expand_macros=expand_macros)
         _index = ProgramIndex(_program)
         _facts = FieldFacts(_program)
         return build_payload(_program)
+
+
+def _parse_warnings(code: str) -> list:
+    """Parser warnings for ``code``, computed on the macro-resolved source."""
+    try:
+        return SASParser().parse(expand_for_report(code)).get_warnings()
+    except Exception:
+        return []
+
+
+def _tables(code: str) -> Dict[str, Any]:
+    """Persistent-library table inventory for ``code`` (macros always resolved)."""
+    inventory = build_inventory(code)
+    inventory["warnings"] = _parse_warnings(code)
+    return inventory
+
+
+def _tables_xlsx(code: str) -> bytes:
+    inventory = build_inventory(code)
+    warnings = _parse_warnings(code)
+    inventory["warnings"] = warnings
+    buf = io.BytesIO()
+    write_xlsx(buf, inventory_sheets(inventory, warnings))
+    return buf.getvalue()
 
 
 def _slm_explain(system: str, user: str) -> Optional[str]:
@@ -160,6 +197,16 @@ class _Handler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, data: Any) -> None:
         self._send(status, json.dumps(data).encode("utf-8"), "application/json")
 
+    def _send_file(self, status: int, body: bytes, content_type: str,
+                   filename: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _read_body(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
@@ -169,6 +216,13 @@ class _Handler(BaseHTTPRequestHandler):
             return json.loads(raw)
         except json.JSONDecodeError:
             return {}
+
+    def _code_for(self, body: Dict[str, Any]) -> str:
+        code = str(body.get("code") or "")
+        if code.strip():
+            return code
+        with _lock:
+            return _last_code or _demo_code()
 
     def _serve_static(self, rel_path: str) -> None:
         path = STATIC_DIR / rel_path
@@ -197,6 +251,18 @@ class _Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/demo":
             payload = _parse(_demo_code())
             self._send_json(200, payload)
+        elif parsed.path == "/api/tables":
+            with _lock:
+                code = _last_code or _demo_code()
+            self._send_json(200, _tables(code))
+        elif parsed.path == "/api/tables.xlsx":
+            with _lock:
+                code = _last_code or _demo_code()
+            self._send_file(
+                200, _tables_xlsx(code),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "persistent_library_tables.xlsx",
+            )
         elif parsed.path.startswith("/api/"):
             self._send_json(404, {"error": "Unknown API endpoint"})
         else:
@@ -213,6 +279,14 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             payload = _parse(code, bool(body.get("expand_macros", False)))
             self._send_json(200, payload)
+        elif parsed.path == "/api/tables":
+            self._send_json(200, _tables(self._code_for(self._read_body())))
+        elif parsed.path == "/api/tables.xlsx":
+            self._send_file(
+                200, _tables_xlsx(self._code_for(self._read_body())),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "persistent_library_tables.xlsx",
+            )
         elif parsed.path == "/api/run":
             body = self._read_body()
             field = body.get("field", "")

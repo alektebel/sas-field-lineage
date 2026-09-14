@@ -88,6 +88,7 @@ def main():
     tracker = LineageTracker(program)
     
     print(f"Found {len(program.get_all_fields())} fields in {len(program.data_steps)} data steps")
+    print_warnings(program)
     print()
     
     # Execute requested operation
@@ -123,6 +124,20 @@ def main():
         print(f"\nResults saved to {args.output}")
     
     return 0
+
+
+def print_warnings(program, limit: int = 20):
+    """Print parse warnings to stderr so they never pollute piped JSON output."""
+    warnings = program.get_warnings()
+    if not warnings:
+        return
+    print(f"⚠️  {len(warnings)} parse warning(s) — lineage may be incomplete:",
+          file=sys.stderr)
+    for w in warnings[:limit]:
+        loc = f"line {w['line']}" if w.get("line") else "unknown line"
+        print(f"   - [{w.get('kind', 'parse')}] {loc}: {w['message']}", file=sys.stderr)
+    if len(warnings) > limit:
+        print(f"   … {len(warnings) - limit} more", file=sys.stderr)
 
 
 def print_query_result(result):

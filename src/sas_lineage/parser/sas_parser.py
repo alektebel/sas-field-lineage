@@ -18,6 +18,27 @@ SAS_KEYWORDS = {
     'data', 'set', 'merge', 'by', 'run', 'proc', 'quit'
 }
 
+# Top-level statements that are intentionally not part of field lineage and so
+# must not raise "unrecognized statement" warnings.
+_BENIGN_TOP_LEVEL = {
+    'libname', 'filename', 'options', 'option', 'goptions', 'title', 'footnote',
+    'ods', 'dm', 'x', 'endsas', 'run', 'quit', 'data', 'proc',
+    'cards', 'datalines', 'cards4', 'datalines4',
+}
+
+# DATA-step statements the parser does not model. They do not stop parsing, but
+# they mean the extracted lineage may be incomplete, so they are warned about.
+_UNSUPPORTED_IN_DATA = {
+    'if', 'then', 'else', 'select', 'when', 'otherwise', 'do', 'end', 'array',
+    'retain', 'length', 'format', 'informat', 'label', 'attrib', 'infile',
+    'input', 'output', 'delete', 'drop', 'keep', 'rename', 'where', 'stop',
+    'abort', 'call', 'return', 'link', 'goto', 'file', 'put', 'list',
+    'lostcard', 'missing', 'window', 'display', 'modify', 'update', 'declare',
+}
+
+# Keep warning payloads bounded on large, messy programs.
+_MAX_WARNINGS = 200
+
 
 class SASParser:
     """
@@ -26,7 +47,36 @@ class SASParser:
     
     def __init__(self):
         self.current_line = 0
-        
+        self._warned: set = set()
+
+    def _warn(self, program: SASProgram, message: str, line: Optional[int],
+              statement: Optional[str] = None, kind: str = "parse",
+              key: Optional[tuple] = None) -> None:
+        """Record a deduplicated, capped parse warning on ``program``."""
+        if len(program.warnings) >= _MAX_WARNINGS:
+            return
+        dedup = key or (kind, message)
+        if dedup in self._warned:
+            return
+        self._warned.add(dedup)
+        program.add_warning(
+            message, line=line,
+            statement=(statement or "")[:200] or None, kind=kind,
+        )
+
+    @staticmethod
+    def _leading(text: str) -> str:
+        match = re.match(r"([A-Za-z_]\w*)", text)
+        return match.group(1).lower() if match else ""
+
+    @classmethod
+    def _is_unrecognized_top(cls, text: str) -> bool:
+        """True for a top-level statement that is not a known/benign one."""
+        if text.startswith("%") or text.startswith("*"):
+            return False
+        token = cls._leading(text)
+        return bool(token) and token not in _BENIGN_TOP_LEVEL
+
     def parse(self, sas_code: str, expand_macros: bool = False, include_base: Optional[str] = None) -> SASProgram:
         """
         Parse SAS code end-to-end and return a SASProgram with field lineage.
@@ -47,6 +97,7 @@ class SASParser:
         Included files are read from that directory (or below) only.
         """
         program = SASProgram()
+        self._warned = set()
         if expand_macros:
             sas_code = preprocess(sas_code, include_base=include_base)
         stmts = self._tokenize(sas_code)
@@ -59,16 +110,23 @@ class SASParser:
             if not text:
                 i += 1
                 continue
-            if upper.startswith('DATA '):
-                data_step, i = self._parse_data_step(stmts, i)
+            if re.match(r'^DATA\s', upper):
+                data_step, i = self._parse_data_step(stmts, i, program)
                 if data_step:
                     program.add_data_step(data_step)
                 continue
-            if upper.startswith('PROC '):
-                proc_step, i = self._parse_proc_step(stmts, i)
+            if re.match(r'^PROC\s', upper):
+                proc_step, i = self._parse_proc_step(stmts, i, program)
                 if proc_step:
                     program.add_proc_step(proc_step)
                 continue
+            if self._is_unrecognized_top(text):
+                self._warn(
+                    program,
+                    f"Unrecognized top-level statement (ignored): '{text[:80]}'",
+                    line, text, kind="unknown-statement",
+                    key=("top", text[:40].lower()),
+                )
             i += 1
 
         return program
@@ -121,47 +179,83 @@ class SASParser:
             stmts.append((cur.strip(), cur_line or 1))
         return stmts
     
-    def _parse_data_step(self, stmts, start_line: int) -> Tuple[Optional[DataStepNode], int]:
+    def _parse_data_step(self, stmts, start_line: int,
+                         program: Optional[SASProgram] = None) -> Tuple[Optional[DataStepNode], int]:
         """
         Parse a DATA step from a list of statements, returning the step and the
         index just after its terminator (``RUN;``/``QUIT;``).
         """
         text, line = stmts[start_line]
-        match = re.search(r'DATA\s+(\w+)', text, re.IGNORECASE)
-        if not match:
+        target_match = re.search(r'DATA\s+([\w.]+)', text, re.IGNORECASE)
+        if not target_match:
+            if program is not None:
+                self._warn(program, f"Could not read the DATA target: '{text[:80]}'",
+                           line, text, kind="data-target")
             return None, start_line + 1
 
-        output_table = match.group(1)
+        full_target = target_match.group(1)
+        output_table = full_target.split('.')[0]
+        if "." in full_target and program is not None:
+            self._warn(
+                program,
+                f"DATA target '{full_target}' is library-qualified; field lineage "
+                f"tracks '{output_table}' (the persistent-tables report keeps the library)",
+                line, text, kind="two-level-name",
+                key=("two-level", "data", full_target.lower()),
+            )
         data_step = DataStepNode(output_table=output_table)
 
         i = start_line + 1
+        terminated = False
         while i < len(stmts):
             stmt, ln = stmts[i]
             upper = stmt.upper()
             # Terminators end the step (RUN; or QUIT;).
             if upper.startswith('RUN') or upper.startswith('QUIT'):
                 i += 1
+                terminated = True
                 break
             # A datalines/cards block is opaque data — nothing to extract.
             if re.match(r'^(DATALINES4?|CARDS4?)\b', upper):
                 i += 1
+                terminated = True
+                break
+            # A new step before a terminator means the current one is truncated.
+            if re.match(r'^DATA\s', upper) or re.match(r'^PROC\s', upper):
+                if program is not None:
+                    self._warn(
+                        program,
+                        f"DATA step '{output_table}' has no RUN; before the next "
+                        f"step at line {ln}",
+                        line, text, kind="unterminated",
+                        key=("unterminated", "data", output_table),
+                    )
                 break
 
             if upper.startswith('SET '):
-                set_match = re.search(r'SET\s+([\w\s]+)', stmt, re.IGNORECASE)
+                set_match = re.search(r'SET\s+([\w.\s]+)', stmt, re.IGNORECASE)
                 if set_match:
                     data_step.input_tables.extend(
-                        t for t in set_match.group(1).split() if t.strip())
+                        t.split('.')[0] for t in set_match.group(1).split() if t.strip())
             elif upper.startswith('MERGE '):
-                merge_match = re.search(r'MERGE\s+([\w\s]+)', stmt, re.IGNORECASE)
+                merge_match = re.search(r'MERGE\s+([\w.\s]+)', stmt, re.IGNORECASE)
                 if merge_match:
                     data_step.input_tables.extend(
-                        t for t in merge_match.group(1).split() if t.strip())
+                        t.split('.')[0] for t in merge_match.group(1).split() if t.strip())
             elif upper.startswith('BY '):
                 by_match = re.search(r'BY\s+([\w\s]+)', stmt, re.IGNORECASE)
                 if by_match:
                     data_step.merge_keys.extend(k for k in by_match.group(1).split() if k.strip())
             else:
+                lead = self._leading(upper)
+                if lead in _UNSUPPORTED_IN_DATA and program is not None:
+                    self._warn(
+                        program,
+                        f"Unsupported statement in DATA step '{output_table}' "
+                        f"(lineage may be incomplete): '{stmt[:80]}'",
+                        ln, stmt, kind="unsupported",
+                        key=("data-unsupported", output_table, lead),
+                    )
                 assignment_match = re.search(r'(\w+)\s*=\s*(.+)', stmt)
                 if assignment_match:
                     field_name = assignment_match.group(1)
@@ -179,9 +273,18 @@ class SASParser:
                     data_step.add_field(field_node)
             i += 1
 
+        if not terminated and program is not None:
+            self._warn(
+                program,
+                f"DATA step '{output_table}' may be unterminated (no RUN;/QUIT; "
+                f"before end of file)",
+                line, text, kind="unterminated",
+                key=("unterminated", "data", output_table),
+            )
         return data_step, i
     
-    def _parse_proc_step(self, stmts, start_line: int) -> Tuple[Optional[ProcStepNode], int]:
+    def _parse_proc_step(self, stmts, start_line: int,
+                         program: Optional[SASProgram] = None) -> Tuple[Optional[ProcStepNode], int]:
         """
         Parse a PROC step (simplified), returning the step and the index just
         after its terminator (``RUN;`` or ``QUIT;``).
@@ -191,32 +294,76 @@ class SASParser:
         # Extract PROC name
         match = re.search(r'PROC\s+(\w+)', text, re.IGNORECASE)
         if not match:
+            if program is not None:
+                self._warn(program, f"Could not read the PROC name: '{text[:80]}'",
+                           line, text, kind="proc-name")
             return None, start_line + 1
 
         proc_name = match.group(1).upper()
         proc_step = ProcStepNode(proc_name=proc_name)
+        if program is not None:
+            self._warn_two_level(program, proc_name, text, line)
 
         i = start_line + 1
+        terminated = False
         while i < len(stmts):
             stmt, ln = stmts[i]
             upper = stmt.upper()
             if upper.startswith('RUN') or upper.startswith('QUIT'):
                 i += 1
+                terminated = True
+                break
+            if re.match(r'^DATA\s', upper) or re.match(r'^PROC\s', upper):
+                if program is not None:
+                    self._warn(
+                        program,
+                        f"PROC {proc_name} step has no RUN;/QUIT; before the next "
+                        f"step at line {ln}",
+                        line, text, kind="unterminated",
+                        key=("unterminated", "proc", proc_name),
+                    )
                 break
 
             # Extract DATA= option
-            data_match = re.search(r'DATA\s*=\s*(\w+)', stmt, re.IGNORECASE)
+            data_match = re.search(r'DATA\s*=\s*([\w.]+)', stmt, re.IGNORECASE)
             if data_match:
-                proc_step.input_table = data_match.group(1)
+                proc_step.input_table = data_match.group(1).split('.')[0]
 
             # Extract OUT= option
-            out_match = re.search(r'OUT\s*=\s*(\w+)', stmt, re.IGNORECASE)
+            out_match = re.search(r'OUT\s*=\s*([\w.]+)', stmt, re.IGNORECASE)
             if out_match:
-                proc_step.output_table = out_match.group(1)
+                proc_step.output_table = out_match.group(1).split('.')[0]
 
+            if program is not None:
+                self._warn_two_level(program, proc_name, stmt, ln)
             i += 1
 
+        if not terminated and program is not None:
+            self._warn(
+                program,
+                f"PROC {proc_name} step may be unterminated (no RUN;/QUIT; before "
+                f"end of file)",
+                line, text, kind="unterminated",
+                key=("unterminated", "proc", proc_name),
+            )
         return proc_step, i
+
+    def _warn_two_level(self, program: SASProgram, proc_name: str, stmt: str,
+                        line: Optional[int]) -> None:
+        """Warn when a PROCEDURE statement uses a library-qualified name."""
+        for kw, match in (
+            ("DATA", re.search(r'DATA\s*=\s*([\w.]+)', stmt, re.IGNORECASE)),
+            ("OUT", re.search(r'OUT\s*=\s*([\w.]+)', stmt, re.IGNORECASE)),
+        ):
+            if match and "." in match.group(1):
+                name = match.group(1)
+                self._warn(
+                    program,
+                    f"PROC {proc_name} {kw}= uses library-qualified name '{name}'; "
+                    f"field lineage is library-agnostic",
+                    line, stmt, kind="two-level-name",
+                    key=("two-level", f"proc-{kw.lower()}", name.lower()),
+                )
     
     def _extract_field_references(self, expression: str, source_tables: List[str]) -> List[Tuple[str, Optional[str]]]:
         """

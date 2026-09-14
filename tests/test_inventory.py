@@ -1,0 +1,178 @@
+"""
+Tests for the persistent-library table report (inventory + xlsx export).
+"""
+import io
+import unittest
+import zipfile
+
+from src.sas_lineage.report import build_inventory, inventory_sheets, write_xlsx
+from src.sas_lineage.report.xlsx import _col_letter
+from src.sas_lineage.parser.preprocessor import expand_for_report, linear_expand
+
+
+class TestInventory(unittest.TestCase):
+    def _names(self, code):
+        inv = build_inventory(code)
+        return {t["name"] for t in inv["tables"]}, inv
+
+    def test_libname_declarations_captured(self):
+        code = "libname stg BASE '/data/stg';\nlibname mrt \"sasdata/mart\";\n"
+        inv = build_inventory(code)
+        libs = {l["libref"]: l for l in inv["libraries"]}
+        self.assertEqual(libs["stg"]["engine"], "BASE")
+        self.assertEqual(libs["stg"]["path"], "/data/stg")
+        self.assertEqual(libs["mrt"]["path"], "sasdata/mart")
+        self.assertTrue(libs["mrt"]["declared"])
+
+    def test_data_step_persistent_but_not_work(self):
+        code = (
+            "data work.temp; set a; x = 1; run;\n"
+            "data stg.raw; set a; x = 1; run;\n"
+            "data local_only; set a; x = 1; run;\n"
+        )
+        names, inv = self._names(code)
+        self.assertEqual(names, {"stg.raw"})
+        self.assertEqual(inv["tables"][0]["input_tables"], "a")
+
+    def test_proc_sql_create_table_and_view(self):
+        code = (
+            "proc sql;\n"
+            "  create table mrt.dim as select * from stg.src;\n"
+            "  create view mrt.v as select * from mrt.dim;\n"
+            "quit;\n"
+        )
+        names, inv = self._names(code)
+        self.assertEqual(names, {"mrt.dim", "mrt.v"})
+        kinds = {t["name"]: t["created_by"] for t in inv["tables"]}
+        self.assertEqual(kinds["mrt.dim"], "PROC SQL CREATE TABLE")
+        self.assertEqual(kinds["mrt.v"], "PROC SQL CREATE VIEW")
+        dim = next(t for t in inv["tables"] if t["name"] == "mrt.dim")
+        self.assertEqual(dim["input_tables"], "stg.src")
+
+    def test_proc_out_options(self):
+        code = (
+            "proc sort data=mrt.final out=mrt.sorted; by z; run;\n"
+            "proc means data=mrt.sorted; output out=mrt.stats mean=avg; run;\n"
+            "proc append base=mrt.acc data=mrt.new; run;\n"
+        )
+        names, inv = self._names(code)
+        self.assertEqual(names, {"mrt.sorted", "mrt.stats", "mrt.acc"})
+        by_name = {t["name"]: t for t in inv["tables"]}
+        self.assertEqual(by_name["mrt.sorted"]["created_by"], "PROC SORT")
+        self.assertEqual(by_name["mrt.stats"]["created_by"], "PROC MEANS")
+        self.assertEqual(by_name["mrt.acc"]["created_by"], "PROC APPEND")
+
+    def test_macro_loop_prefix_resolved(self):
+        code = """
+        libname mrt 'x';
+        %let prefix = clm;
+        %macro build(lib);
+          %do i = 1 %to 2;
+            data &lib..&prefix._&i;
+              set stg.src_&i;
+              amount = value * 2;
+            run;
+          %end;
+        %mend;
+        %build(mrt)
+        """
+        names, inv = self._names(code)
+        self.assertEqual(names, {"mrt.clm_1", "mrt.clm_2"})
+        for table in inv["tables"]:
+            self.assertTrue(table["macro_built"])
+            self.assertTrue(table["resolved"])
+        self.assertEqual(inv["stats"]["macro_built"], 2)
+
+    def test_unresolved_macro_is_flagged_not_dropped(self):
+        code = "data &missinglib..orphan; set stg.x; q = 1; run;\n"
+        names, inv = self._names(code)
+        self.assertEqual(names, {"&missinglib.orphan"})
+        self.assertEqual(inv["stats"]["unresolved"], 1)
+        self.assertFalse(inv["tables"][0]["resolved"])
+
+    def test_undeclared_non_work_library_is_persistent(self):
+        code = "data otherlib.t; set a; x = 1; run;\n"
+        names, inv = self._names(code)
+        self.assertEqual(names, {"otherlib.t"})
+        self.assertFalse(inv["tables"][0]["declared_library"])
+
+    def test_expand_disabled_keeps_raw_names(self):
+        code = "%let p = clm;\ndata mrt.&p._1; set x; run;\n"
+        inv = build_inventory(code, expand=False)
+        names = {t["name"] for t in inv["tables"]}
+        self.assertIn("mrt.&p._1", names)
+
+
+class TestMacroLinearExpansion(unittest.TestCase):
+    def test_linear_expand_resolves_let_and_prefix(self):
+        code = "%let lib = stg;\n%let prefix = clm;\ndata &lib..&prefix._1; set x; run;\n"
+        out = linear_expand(code)
+        self.assertIn("data stg.clm_1;", out)
+        self.assertNotIn("%let", out)
+
+    def test_linear_expand_keeps_unknown(self):
+        out = linear_expand("data &missing.base; set x; run;\n")
+        self.assertIn("&missing.base", out)
+
+    def test_expand_for_report_expands_macros_and_keeps_unknown(self):
+        code = (
+            "%macro go(lib);\n"
+            "%do i=1 %to 2;\n"
+            "data &lib..t_&i; set s_&i; run;\n"
+            "%end;\n%mend;\n%go(mrt)\n"
+            "data &nope.x; set y; run;\n"
+        )
+        out = expand_for_report(code)
+        self.assertIn("data mrt.t_1;", out)
+        self.assertIn("data mrt.t_2;", out)
+        self.assertIn("&nope.x", out)
+
+
+class TestXlsxWriter(unittest.TestCase):
+    def _workbook(self, sheets):
+        buf = io.BytesIO()
+        write_xlsx(buf, sheets)
+        buf.seek(0)
+        return zipfile.ZipFile(buf)
+
+    def test_writes_valid_zip_with_expected_parts(self):
+        z = self._workbook([("Persistent tables", [["A", "B"], ["1", "2"]])])
+        self.assertIsNone(z.testzip())
+        for part in ("[Content_Types].xml", "_rels/.rels", "xl/workbook.xml",
+                     "xl/_rels/workbook.xml.rels", "xl/styles.xml",
+                     "xl/worksheets/sheet1.xml"):
+            self.assertIn(part, z.namelist())
+
+    def test_cell_values_and_bold_header(self):
+        z = self._workbook([("T", [["Library", "Table"], ["mrt", "final"]])])
+        xml = z.read("xl/worksheets/sheet1.xml").decode()
+        self.assertIn("Library", xml)
+        self.assertIn("mrt", xml)
+        self.assertIn('s="1"', xml)          # header style
+        self.assertIn('t="inlineStr"', xml)
+
+    def test_multiple_sheets(self):
+        z = self._workbook([("One", [["x"]]), ("Two", [["y"], ["z"]])])
+        self.assertIn("xl/worksheets/sheet2.xml", z.namelist())
+        wb = z.read("xl/workbook.xml").decode()
+        self.assertIn('name="One"', wb)
+        self.assertIn('name="Two"', wb)
+
+    def test_column_letters(self):
+        self.assertEqual(_col_letter(1), "A")
+        self.assertEqual(_col_letter(26), "Z")
+        self.assertEqual(_col_letter(27), "AA")
+        self.assertEqual(_col_letter(28), "AB")
+
+    def test_inventory_sheets_shape(self):
+        inv = build_inventory("libname mrt 'x';\ndata mrt.t; set a; x=1; run;\n")
+        sheets = inventory_sheets(inv)
+        names = [name for name, _rows in sheets]
+        self.assertEqual(names, ["Persistent tables", "Libraries", "Summary"])
+        header = sheets[0][1][0]
+        self.assertIn("Library", header)
+        self.assertIn("Table", header)
+
+
+if __name__ == "__main__":
+    unittest.main()

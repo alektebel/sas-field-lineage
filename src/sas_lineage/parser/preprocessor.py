@@ -252,10 +252,14 @@ def _eval_cond(expr: str, resolve) -> bool:
 
 
 class MacroPreprocessor:
-    def __init__(self, include_base: Optional[str] = None):
+    def __init__(self, include_base: Optional[str] = None, preserve_unknown: bool = False):
         self.macros: Dict[str, Dict] = {}
         self.symbols: Dict[str, str] = {}
         self.include_base = include_base
+        # When True, ``&name`` references with no matching %let are kept as-is
+        # instead of collapsing to an empty string. Used by the persistent-
+        # table report so unresolved library/prefix names can be flagged.
+        self.preserve_unknown = preserve_unknown
         self._include_seen: set = set()
 
     # ------------------------------------------------------------------ #
@@ -282,21 +286,32 @@ class MacroPreprocessor:
             return "none", "", amp_idx + 1
         name = m.group(1)
         j += m.end()
+        # Keep the delimiter dot when an unknown symbol is being preserved, so
+        # ``&nope.x`` stays ``&nope.x`` instead of collapsing to ``&nopex``.
         if j < len(text) and text[j] == ".":
-            j += 1  # consume the name-delimiter dot
+            if not (self.preserve_unknown and not self._has_sym(name, scope)):
+                j += 1  # consume the name-delimiter dot
         if indirection:
             val = self._symval(name, scope)
             for _ in range(indirection - 1):
+                if val.startswith("&"):
+                    break
                 val = self._symval(val.strip(), scope)
             return "val", val, j
         return "sym", name, j
+
+    def _has_sym(self, name: str, scope: Dict[str, str]) -> bool:
+        key = name.lower()
+        return key in scope or key in self.symbols
 
     def _symval(self, name: str, scope: Dict[str, str]) -> str:
         key = name.lower()
         val = scope.get(key)
         if val is None and scope is not self.symbols:
             val = self.symbols.get(key)
-        return val if val is not None else ""
+        if val is not None:
+            return val
+        return "&" + name if self.preserve_unknown else ""
 
     def _resolve(self, text: str, scope: Dict[str, str]) -> str:
         out = []
@@ -833,6 +848,72 @@ class MacroPreprocessor:
 
 def _has_steps(text: str) -> bool:
     return re.search(r"(?m)^\s*(?:data|proc)\s+\w", text) is not None
+
+
+_SYMREF_RE = re.compile(r"(&+)([A-Za-z_]\w*)\.?")
+_LET_STMT_RE = re.compile(r"%\s*let\s+([A-Za-z_]\w*)\s*=\s*(.*?);", re.IGNORECASE | re.DOTALL)
+
+
+def _substitute_symbols(text: str, symbols: Dict[str, str]) -> str:
+    """Left-to-right ``&var`` / ``&&var`` substitution that keeps unknowns.
+
+    A single trailing ``.`` is SAS's name delimiter and is consumed, so
+    ``&lib..raw`` -> ``stg.raw`` and ``&prefix._&i`` -> ``out_1``.
+    """
+    def repl(match: "re.Match[str]") -> str:
+        amps = len(match.group(1))
+        name = match.group(2).lower()
+        val = symbols.get(name)
+        if val is None:
+            return match.group(0)
+        for _ in range(amps - 1):
+            if val.startswith("&"):
+                break
+            nxt = symbols.get(val.strip().lower())
+            if nxt is None:
+                break
+            val = nxt
+        return val
+
+    return _SYMREF_RE.sub(repl, text)
+
+
+def linear_expand(code: str, symbols: Optional[Dict[str, str]] = None) -> str:
+    """Resolve ``%let`` / ``&var`` / ``&&var`` by simple linear replacement.
+
+    This is the always-on runtime substitution used by the persistent-table
+    report: it needs no full macro engine, never drops code, and leaves any
+    reference it cannot resolve in place so it can be reported as unresolved
+    rather than silently vanishing. ``%macro`` bodies are handled by the full
+    :func:`preprocess` pass; this only deals with symbol text.
+    """
+    text = _strip_macro_comments(code)
+    syms: Dict[str, str] = {k.lower(): v for k, v in (symbols or {}).items()}
+    while True:
+        m = _LET_STMT_RE.search(text)
+        if not m:
+            break
+        syms[m.group(1).lower()] = _substitute_symbols(m.group(2).strip(), syms)
+        text = text[:m.start()] + text[m.end():]
+    return _substitute_symbols(text, syms)
+
+
+def expand_for_report(code: str, include_base: Optional[str] = None) -> str:
+    """Expand macros for the persistent-table report.
+
+    Unlike :func:`preprocess`, this always resolves ``%let`` / ``&`` symbols
+    (even when the caller did not opt in) and keeps references it cannot
+    resolve. The supported ``%macro`` / ``%do`` / ``%if`` subset is expanded
+    first so steps generated inside macros are visible; on any failure it
+    falls back to plain linear substitution so the report still runs.
+    """
+    try:
+        return MacroPreprocessor(include_base, preserve_unknown=True).preprocess(code)
+    except Exception:
+        try:
+            return linear_expand(code)
+        except Exception:
+            return code
 
 
 def preprocess(code: str, include_base: Optional[str] = None) -> str:

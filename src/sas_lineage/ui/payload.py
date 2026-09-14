@@ -362,11 +362,13 @@ def build_payload(program: SASProgram) -> Dict[str, Any]:
     # Order registers by layer column so the sidebar reads source -> sink.
     observed = {n["register"]: n["col"] for n in graph["N"]}
     ordered = sorted(observed.keys(), key=lambda r: observed[r])
+    warnings = program.get_warnings()
     stats = {
         "traced_fields": len(fields),
         "golden_sources": sum(1 for n in graph["N"] if n["golden"]),
         "registers": len(ordered),
         "datasets": len(graph["N"]),
+        "warnings": len(warnings),
     }
     return {
         "N": graph["N"],
@@ -374,5 +376,6 @@ def build_payload(program: SASProgram) -> Dict[str, Any]:
         "LAYERS": graph["LAYERS"],
         "registers": ordered,
         "F": fields,
+        "warnings": warnings,
         "stats": stats,
     }
