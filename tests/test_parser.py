@@ -122,11 +122,30 @@ class TestParseWarnings(unittest.TestCase):
         code = "libname mrt '/x';\noptions validvarname=any;\ntitle 't';\nrun;\n"
         self.assertEqual(self.parser.parse(code).get_warnings(), [])
 
-    def test_unsupported_data_statement_warns(self):
-        code = "data out; set src; drop temp; x = 1; run;\n"
-        warnings = self.parser.parse(code).get_warnings()
-        self.assertIn("unsupported", {w["kind"] for w in warnings})
-        self.assertTrue(any("drop temp" in w["message"] for w in warnings))
+    def test_unsupported_data_statement_warns_once_per_step(self):
+        code = "data out; set src; drop temp; keep a; if x then y = 1; run;\n"
+        warnings = [w for w in self.parser.parse(code).get_warnings()
+                    if w["kind"] == "unsupported"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("drop", warnings[0]["message"])
+        self.assertIn("keep", warnings[0]["message"])
+
+    def test_declarative_data_statements_do_not_warn(self):
+        code = ("data out; set src; length id $32; format amount 12.2; "
+                "label amount='a'; retain total 0; x = 1; run;\n")
+        self.assertEqual(self.parser.parse(code).get_warnings(), [])
+
+    def test_read_only_procs_are_not_parsed_or_warned(self):
+        code = "proc print data=work.x; var a b; run;\ndata out; set src; v = 1; run;\n"
+        program = self.parser.parse(code)
+        self.assertEqual([p.proc_name for p in program.proc_steps], [])
+        self.assertEqual(program.get_warnings(), [])
+
+    def test_coverage_stat_reported(self):
+        code = "FOOBAR x;\ndata out; set src; v = 1; run;\n"
+        program = self.parser.parse(code)
+        self.assertIn("coverage", program.stats)
+        self.assertLess(program.stats["coverage"], 100.0)
 
     def test_unterminated_step_warns(self):
         code = "data out; set src; x = 1;\n"
@@ -149,6 +168,13 @@ class TestParseWarnings(unittest.TestCase):
         code = "FOOBAR something;\ndata out; set src; x = 1; run;\n"
         kinds = self._kinds(code)
         self.assertIn("unknown-statement", kinds)
+
+    def test_top_level_assignments_are_aggregated(self):
+        code = "a = 1;\nb = 2;\nc = 3;\ndata ok; set s; v = 1; run;\n"
+        warnings = [w for w in self.parser.parse(code).get_warnings()
+                    if w["kind"] == "out-of-step"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("3 statement", warnings[0]["message"])
 
     def test_repeated_unsupported_statement_is_deduplicated(self):
         body = "".join(f"drop t{i};\n" for i in range(50))

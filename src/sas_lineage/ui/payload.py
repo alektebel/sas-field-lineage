@@ -363,12 +363,16 @@ def build_payload(program: SASProgram) -> Dict[str, Any]:
     observed = {n["register"]: n["col"] for n in graph["N"]}
     ordered = sorted(observed.keys(), key=lambda r: observed[r])
     warnings = program.get_warnings()
+    parse_stats = getattr(program, "stats", {}) or {}
     stats = {
         "traced_fields": len(fields),
         "golden_sources": sum(1 for n in graph["N"] if n["golden"]),
         "registers": len(ordered),
         "datasets": len(graph["N"]),
         "warnings": len(warnings),
+        "coverage": parse_stats.get("coverage", 100.0),
+        "statements": parse_stats.get("statements", 0),
+        "ignored": parse_stats.get("ignored", 0),
     }
     return {
         "N": graph["N"],

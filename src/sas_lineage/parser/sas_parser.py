@@ -26,15 +26,17 @@ _BENIGN_TOP_LEVEL = {
     'cards', 'datalines', 'cards4', 'datalines4',
 }
 
-# DATA-step statements the parser does not model. They do not stop parsing, but
-# they mean the extracted lineage may be incomplete, so they are warned about.
+# DATA-step statements that change the shape of the output and so can hide
+# lineage. Declarative statements (LENGTH, FORMAT, LABEL, INPUT, RETAIN, ...)
+# are intentionally *not* listed: they do not affect field lineage and warning
+# about them is just noise. The set is aggregated per DATA step.
 _UNSUPPORTED_IN_DATA = {
-    'if', 'then', 'else', 'select', 'when', 'otherwise', 'do', 'end', 'array',
-    'retain', 'length', 'format', 'informat', 'label', 'attrib', 'infile',
-    'input', 'output', 'delete', 'drop', 'keep', 'rename', 'where', 'stop',
-    'abort', 'call', 'return', 'link', 'goto', 'file', 'put', 'list',
-    'lostcard', 'missing', 'window', 'display', 'modify', 'update', 'declare',
+    'drop', 'keep', 'rename', 'if', 'where', 'select', 'when', 'otherwise',
 }
+
+# Procs that only read/report and never produce a dataset. They are consumed
+# without creating a lineage step or emitting warnings.
+_READ_ONLY_PROCS = {'PRINT', 'CONTENTS', 'DATASETS', 'CATALOG', 'FORMS'}
 
 # Keep warning payloads bounded on large, messy programs.
 _MAX_WARNINGS = 200
@@ -48,6 +50,8 @@ class SASParser:
     def __init__(self):
         self.current_line = 0
         self._warned: set = set()
+        self._two_level = 0
+        self._top_unrecognized: List[Tuple[str, str, int]] = []
 
     def _warn(self, program: SASProgram, message: str, line: Optional[int],
               statement: Optional[str] = None, kind: str = "parse",
@@ -98,10 +102,13 @@ class SASParser:
         """
         program = SASProgram()
         self._warned = set()
+        self._two_level = 0
+        self._top_unrecognized = []
         if expand_macros:
             sas_code = preprocess(sas_code, include_base=include_base)
         stmts = self._tokenize(sas_code)
 
+        total = len(stmts)
         i = 0
         while i < len(stmts):
             text, line = stmts[i]
@@ -110,26 +117,60 @@ class SASParser:
             if not text:
                 i += 1
                 continue
-            if re.match(r'^DATA\s', upper):
+            if re.match(r'^DATA\b', upper):
                 data_step, i = self._parse_data_step(stmts, i, program)
                 if data_step:
                     program.add_data_step(data_step)
                 continue
-            if re.match(r'^PROC\s', upper):
+            if re.match(r'^PROC\b', upper):
                 proc_step, i = self._parse_proc_step(stmts, i, program)
                 if proc_step:
                     program.add_proc_step(proc_step)
                 continue
             if self._is_unrecognized_top(text):
-                self._warn(
-                    program,
-                    f"Unrecognized top-level statement (ignored): '{text[:80]}'",
-                    line, text, kind="unknown-statement",
-                    key=("top", text[:40].lower()),
-                )
+                self._top_unrecognized.append((self._leading(upper) or upper[:12].lower(), text, line))
             i += 1
 
+        self._flush_unrecognized(program)
+        if self._two_level:
+            self._warn(
+                program,
+                f"{self._two_level} library-qualified name(s) (lib.table) found; field lineage is "
+                f"library-agnostic and the persistent-tables report keeps the library",
+                None, None, kind="two-level-name", key=("two-level",),
+            )
+        ignored = len(self._top_unrecognized)
+        program.stats = {
+            "statements": total,
+            "ignored": ignored,
+            "coverage": round(100.0 * (total - ignored) / total, 1) if total else 100.0,
+        }
         return program
+
+    def _flush_unrecognized(self, program: SASProgram) -> None:
+        """Summarise top-level statements that belong to no DATA/PROC step."""
+        if not self._top_unrecognized:
+            return
+        assignments = [t for _t, t, _l in self._top_unrecognized
+                       if re.match(r"[A-Za-z_]\w*\s*=", t)]
+        if assignments:
+            self._warn(
+                program,
+                f"{len(assignments)} statement(s) could not be attributed to a DATA/PROC step "
+                f"(e.g. '{assignments[0][:60]}'); they were ignored",
+                None, None, kind="out-of-step", key=("out-of-step",),
+            )
+        others: Dict[str, Tuple[str, int]] = {}
+        for token, text, line in self._top_unrecognized:
+            if re.match(r"[A-Za-z_]\w*\s*=", text):
+                continue
+            others.setdefault(token, (text, line))
+        for token, (text, line) in list(others.items())[:10]:
+            self._warn(
+                program,
+                f"Unrecognized top-level statement (ignored): '{text[:80]}'",
+                line, text, kind="unknown-statement", key=("top", token),
+            )
 
     def _tokenize(self, sas_code: str) -> List[Tuple[str, int]]:
         """
@@ -186,27 +227,20 @@ class SASParser:
         index just after its terminator (``RUN;``/``QUIT;``).
         """
         text, line = stmts[start_line]
-        target_match = re.search(r'DATA\s+([\w.]+)', text, re.IGNORECASE)
-        if not target_match:
-            if program is not None:
-                self._warn(program, f"Could not read the DATA target: '{text[:80]}'",
-                           line, text, kind="data-target")
-            return None, start_line + 1
-
-        full_target = target_match.group(1)
+        # Permissive: capture ``lib.table``, ``&macro.name`` or ``%name`` too.
+        target_match = re.search(r'DATA\s+([^\s;]+)', text, re.IGNORECASE)
+        full_target = target_match.group(1) if target_match else ""
         output_table = full_target.split('.')[0]
-        if "." in full_target and program is not None:
-            self._warn(
-                program,
-                f"DATA target '{full_target}' is library-qualified; field lineage "
-                f"tracks '{output_table}' (the persistent-tables report keeps the library)",
-                line, text, kind="two-level-name",
-                key=("two-level", "data", full_target.lower()),
-            )
-        data_step = DataStepNode(output_table=output_table)
+        if "." in full_target:
+            self._two_level += 1
+        if not output_table and program is not None:
+            self._warn(program, f"Could not read the DATA target: '{text[:80]}'",
+                       line, text, kind="data-target")
+        data_step = DataStepNode(output_table=output_table or "(unknown)")
 
         i = start_line + 1
         terminated = False
+        unsupported: set = set()
         while i < len(stmts):
             stmt, ln = stmts[i]
             upper = stmt.upper()
@@ -225,10 +259,10 @@ class SASParser:
                 if program is not None:
                     self._warn(
                         program,
-                        f"DATA step '{output_table}' has no RUN; before the next "
+                        f"DATA step '{data_step.output_table}' has no RUN; before the next "
                         f"step at line {ln}",
                         line, text, kind="unterminated",
-                        key=("unterminated", "data", output_table),
+                        key=("unterminated", "data", data_step.output_table),
                     )
                 break
 
@@ -248,14 +282,8 @@ class SASParser:
                     data_step.merge_keys.extend(k for k in by_match.group(1).split() if k.strip())
             else:
                 lead = self._leading(upper)
-                if lead in _UNSUPPORTED_IN_DATA and program is not None:
-                    self._warn(
-                        program,
-                        f"Unsupported statement in DATA step '{output_table}' "
-                        f"(lineage may be incomplete): '{stmt[:80]}'",
-                        ln, stmt, kind="unsupported",
-                        key=("data-unsupported", output_table, lead),
-                    )
+                if lead in _UNSUPPORTED_IN_DATA:
+                    unsupported.add(lead)
                 assignment_match = re.search(r'(\w+)\s*=\s*(.+)', stmt)
                 if assignment_match:
                     field_name = assignment_match.group(1)
@@ -273,13 +301,21 @@ class SASParser:
                     data_step.add_field(field_node)
             i += 1
 
+        if unsupported and program is not None:
+            self._warn(
+                program,
+                f"DATA step '{data_step.output_table}' uses statement(s) not modelled for "
+                f"lineage ({', '.join(sorted(unsupported))}); lineage may be incomplete",
+                line, text, kind="unsupported",
+                key=("data-unsupported", data_step.output_table),
+            )
         if not terminated and program is not None:
             self._warn(
                 program,
-                f"DATA step '{output_table}' may be unterminated (no RUN;/QUIT; "
+                f"DATA step '{data_step.output_table}' may be unterminated (no RUN;/QUIT; "
                 f"before end of file)",
                 line, text, kind="unterminated",
-                key=("unterminated", "data", output_table),
+                key=("unterminated", "data", data_step.output_table),
             )
         return data_step, i
     
@@ -300,9 +336,13 @@ class SASParser:
             return None, start_line + 1
 
         proc_name = match.group(1).upper()
+
+        # Read-only procs never produce a dataset: consume the step silently.
+        if proc_name in _READ_ONLY_PROCS:
+            return None, self._skip_step(stmts, start_line)
+
         proc_step = ProcStepNode(proc_name=proc_name)
-        if program is not None:
-            self._warn_two_level(program, proc_name, text, line)
+        self._note_two_level(text)
 
         i = start_line + 1
         terminated = False
@@ -334,8 +374,7 @@ class SASParser:
             if out_match:
                 proc_step.output_table = out_match.group(1).split('.')[0]
 
-            if program is not None:
-                self._warn_two_level(program, proc_name, stmt, ln)
+            self._note_two_level(stmt)
             i += 1
 
         if not terminated and program is not None:
@@ -348,22 +387,22 @@ class SASParser:
             )
         return proc_step, i
 
-    def _warn_two_level(self, program: SASProgram, proc_name: str, stmt: str,
-                        line: Optional[int]) -> None:
-        """Warn when a PROCEDURE statement uses a library-qualified name."""
-        for kw, match in (
-            ("DATA", re.search(r'DATA\s*=\s*([\w.]+)', stmt, re.IGNORECASE)),
-            ("OUT", re.search(r'OUT\s*=\s*([\w.]+)', stmt, re.IGNORECASE)),
-        ):
-            if match and "." in match.group(1):
-                name = match.group(1)
-                self._warn(
-                    program,
-                    f"PROC {proc_name} {kw}= uses library-qualified name '{name}'; "
-                    f"field lineage is library-agnostic",
-                    line, stmt, kind="two-level-name",
-                    key=("two-level", f"proc-{kw.lower()}", name.lower()),
-                )
+    def _skip_step(self, stmts, start_line: int) -> int:
+        """Index just after a step's RUN;/QUIT;, or at the next step."""
+        i = start_line + 1
+        while i < len(stmts):
+            upper = stmts[i][0].upper()
+            if upper.startswith('RUN') or upper.startswith('QUIT'):
+                return i + 1
+            if re.match(r'^DATA\s', upper) or re.match(r'^PROC\s', upper):
+                return i
+            i += 1
+        return i
+
+    def _note_two_level(self, stmt: str) -> None:
+        """Count library-qualified (``lib.table``) references without warning."""
+        for match in re.finditer(r'\b(?:DATA|OUT|OUTPUT|BASE)\s*=\s*[A-Za-z_]\w*\.\w+', stmt, re.IGNORECASE):
+            self._two_level += 1
     
     def _extract_field_references(self, expression: str, source_tables: List[str]) -> List[Tuple[str, Optional[str]]]:
         """

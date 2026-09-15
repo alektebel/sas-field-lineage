@@ -127,6 +127,7 @@
     <div style="display:flex;align-items:center;gap:8px;margin-left:auto">
       <button onClick="{{ toggleLeft }}" style="font-family:inherit;font-size:12px;padding:6px 10px;border:1px solid #cfcac5;background:{{ leftBtnBg }};color:#2d2d2d;cursor:pointer;white-space:nowrap">{{ leftBtnLabel }}</button>
       <button onClick="{{ toggleRight }}" style="font-family:inherit;font-size:12px;padding:6px 10px;border:1px solid #cfcac5;background:{{ rightBtnBg }};color:#2d2d2d;cursor:pointer;white-space:nowrap">{{ rightBtnLabel }}</button>
+      <button onClick="{{ toggleFlows }}" style="font-family:inherit;font-size:12px;padding:6px 10px;border:1px solid #cfcac5;background:{{ flowsBtnBg }};color:#2d2d2d;cursor:pointer;white-space:nowrap" title="Show the flow divisions as tiles and which table feeds the next flux">◫ Flows</button>
       <input value="{{ q }}" onInput="{{ onQuery }}" placeholder="Search dataset, register or field…" style="font-family:inherit;font-size:13px;padding:6px 10px;flex:1 1 140px;min-width:120px;max-width:240px;border:1px solid #cfcac5;background:#fff;color:#2d2d2d" />
       <button onClick="{{ reset }}" style="font-family:inherit;font-size:12px;padding:6px 11px;border:1px solid #2d2d2d;background:#fff;cursor:pointer;white-space:nowrap;color:#2d2d2d" style-hover="background:#2d2d2d;color:#fff">Reset</button>
     </div>
@@ -149,6 +150,9 @@
     <sc-if value="{{ warnLabel }}" hint-placeholder-val="{{ '' }}">
       <span style="color:#e0301e;cursor:help;white-space:nowrap" title="{{ warnText }}">{{ warnLabel }}</span>
     </sc-if>
+    <sc-if value="{{ coverageLabel }}" hint-placeholder-val="{{ '' }}">
+      <span style="color:#5c5c5c;white-space:nowrap" title="Share of statements attributed to a DATA/PROC step; ignored statements still appear in the report warnings">{{ coverageLabel }}</span>
+    </sc-if>
     <span style="margin-left:auto;white-space:nowrap">Double-click a field to run values through the graph · ⌘/Ctrl + scroll to zoom</span>
   </div>
 
@@ -158,6 +162,27 @@
         <div style="height:5px;background:#d04a02;width:{{ progressPct }}%;transition:width .25s ease"></div>
       </div>
       <div style="font-size:11px;color:#5c5c5c;margin-top:4px">{{ progressLabel }}</div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ flowsOpen }}" hint-placeholder-val="{{ false }}">
+    <div style="display:flex;gap:12px;overflow:auto;padding:10px 26px;border-bottom:1px solid #e6e2de;background:#fbfaf9">
+      <sc-for list="{{ flows }}" as="fl" hint-placeholder-count="5">
+        <div style="min-width:230px;max-width:330px;flex:none;border:1px solid #dcd8d4;border-left:4px solid {{ fl.rail }};background:#fff;padding:8px 10px">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline">
+            <span style="font-size:12.5px;font-weight:600">{{ fl.label }}</span>
+            <span style="font-size:11px;color:#8a8480">{{ fl.count }}</span>
+          </div>
+          <sc-for list="{{ fl.tables }}" as="t" hint-placeholder-count="3">
+            <div onClick="{{ t.onClick }}" style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:#d04a02;cursor:pointer;padding:2px 0" style-hover="text-decoration:underline">{{ t.name }}</div>
+          </sc-for>
+          <sc-for list="{{ fl.transitions }}" as="tr" hint-placeholder-count="0">
+            <div style="font-size:11px;color:#5c5c5c;margin-top:4px;padding-top:4px;border-top:1px solid #eeeae6;line-height:1.4">
+              <span style="font-family:ui-monospace,Menlo,monospace">{{ tr.from }}</span> → <b>{{ tr.toDiv }}</b>: {{ tr.to }}
+            </div>
+          </sc-for>
+        </div>
+      </sc-for>
     </div>
   </sc-if>
 
@@ -450,10 +475,10 @@ class Component extends DCLogic {
     avail:0, win:1400, zoom:null, leftOpen:null, rightOpen:true,
     importOpen:false, expandMacro:false, sasSummary:'', sasText:'', sasFile:'', vals:{}, run:null,
     explain:{ field:null, text:'', src:'', busy:false, other:'' },
-    tablesNote:'', warnings:[], progress:null,
+    tablesNote:'', warnings:[], progress:null, flowsOpen:false,
     fileNote:'No workbook loaded — using stored sample values.' };
   mainRef = React.createRef();
-  N = []; E = []; F = []; LAYERS = []; _regOrder = [];
+  N = []; E = []; F = []; LAYERS = []; _regOrder = []; _stats = {};
 
   componentDidMount() {
     const measure = () => { const el = this.mainRef.current; if (el) this.setState({ avail: el.clientWidth, win: window.innerWidth }); };
@@ -513,6 +538,7 @@ class Component extends DCLogic {
   applyPayload(p) {
     this.N = p.N || []; this.E = p.E || []; this.F = p.F || []; this.LAYERS = p.LAYERS || [];
     this._regOrder = p.registers || [];
+    this._stats = p.stats || {};
     const selNode = (this.N.find(n => n.golden) && this.N.find(n => n.golden).id) || (this.N[0] && this.N[0].id) || null;
     this.setState({ node: selNode, field:this.F[0] ? this.F[0].id : null, mode:'node', run:null, vals:{}, q:'',
       warnings: p.warnings || [],
@@ -698,15 +724,24 @@ class Component extends DCLogic {
   };
 
   downloadTables = () => {
-    this.setState({ tablesNote:'Building persistent-library report…' });
+    this.setState({ tablesNote:'' });
+    this._setProgress(15, 'Collecting persistent-library writes…');
+    const stage = setTimeout(() => this._setProgress(55, 'Resolving macros, prefixes and divisions…'), 250);
     window.__tablesXlsx(this.state.sasText || '').then(blob => {
+      clearTimeout(stage);
+      this._setProgress(85, 'Writing workbook…');
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url; a.download = 'persistent_library_tables.xlsx';
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
+      this._setProgress(100, 'Done');
+      this._clearProgress(700);
       this.setState({ tablesNote:'Downloaded persistent-library tables (.xlsx)' });
-    }).catch(err => this.setState({ tablesNote:'Export failed: ' + err.message }));
+    }).catch(err => {
+      clearTimeout(stage);
+      this.setState({ progress:null, tablesNote:'Export failed: ' + err.message });
+    });
   };
 
   walk(id, dir, depth) {
@@ -845,6 +880,29 @@ class Component extends DCLogic {
           rowBg: n.id === sel ? '#e9e5e1' : 'transparent', onClick: () => this.pick(n.id) })) };
     }).filter(g => g.count);
 
+    // Flows: one tile per flux/division, its tables, and which table feeds the next flux.
+    const divName = c => { const L = this.LAYERS.find(x => x.col === c); return (L && L.label) || ('Stage ' + (c + 1)); };
+    const divOrder = [...new Set(this.N.map(n => n.col))].sort((a, b) => a - b);
+    const flows = divOrder.map(c => {
+      const mem = this.N.filter(n => n.col === c);
+      const transitions = [];
+      mem.forEach(n => {
+        const byDiv = {};
+        this.E.filter(([a]) => a === n.id).forEach(([, b]) => {
+          const target = this.node(b);
+          if (target.col <= c) return;
+          const dn = divName(target.col);
+          (byDiv[dn] = byDiv[dn] || []).push(target.name);
+        });
+        Object.keys(byDiv).forEach(dn => transitions.push({ from:n.name, toDiv:dn, to:byDiv[dn].join(', ') }));
+      });
+      return {
+        col:c, label:divName(c), count:mem.length, rail: mem.some(n => n.golden) ? P.amber : (c === divOrder[divOrder.length - 1] ? P.orange : '#cfcac5'),
+        tables: mem.map(n => ({ name:n.name, onClick: () => this.pick(n.id) })),
+        transitions,
+      };
+    });
+
     const dd = [{ v:1, label:'1' }, { v:2, label:'2' }, { v:3, label:'3' }, { v:0, label:'All' }].map(d => ({
       label:d.label, bg: depth === d.v ? P.ink : '#fff', fg: depth === d.v ? '#fff' : P.ink,
       border: depth === d.v ? P.ink : '#cfcac5', onClick: () => this.setState({ depth:d.v }) }));
@@ -931,6 +989,10 @@ class Component extends DCLogic {
       progress: !!this.state.progress,
       progressPct: this.state.progress ? this.state.progress.pct : 0,
       progressLabel: this.state.progress ? this.state.progress.label : '',
+      coverageLabel: (this._stats.coverage != null ? (this._stats.coverage + '% of statements parsed' + (this._stats.ignored ? ' · ' + this._stats.ignored + ' ignored' : '')) : ''),
+      flowsOpen: this.state.flowsOpen, flows: flows,
+      toggleFlows: () => this.setState({ flowsOpen: !this.state.flowsOpen }),
+      flowsBtnBg: this.state.flowsOpen ? '#ece9e6' : '#fff',
       warnLabel: this.state.warnings.length ? ('⚠ ' + this.state.warnings.length + ' parser warning' + (this.state.warnings.length === 1 ? '' : 's') + ' — lineage may be incomplete') : '',
       warnText: this.state.warnings.slice(0, 12).map(w => 'line ' + (w.line || '?') + ': ' + w.message).join('\n'),
       onSasFile:this.onSasFile, clearSas: () => this.setState({ sasSummary:'', sasText:'', sasFile:'', tablesNote:'', warnings:[], progress:null }), onDataFile:this.onDataFile,

@@ -61,6 +61,12 @@ class TestPayloadBuilder(unittest.TestCase):
         self.assertIn("revenue", fields)   # derived earlier
         self.assertIn("INPUT_DATA", f["golden"])
 
+    def test_payload_includes_coverage_stat(self):
+        self.assertIn("coverage", self.p["stats"])
+        self.assertLessEqual(self.p["stats"]["coverage"], 100)
+        self.assertIn("warnings", self.p)
+        self.assertIsInstance(self.p["warnings"], list)
+
     def test_registers_ordered_by_column(self):
         cols = {n["register"]: n["col"] for n in self.p["N"]}
         order = [cols[r] for r in self.p["registers"]]
