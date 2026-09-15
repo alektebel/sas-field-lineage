@@ -60,6 +60,15 @@
     if (!r.ok) throw new Error("tables export failed: " + r.status);
     return await r.blob();
   };
+  window.__importFile = async function (filename, contentB64, expand) {
+    var r = await fetch("/api/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ filename: filename, content_b64: contentB64, expand_macros: !!expand })
+    });
+    if (!r.ok) throw new Error("import failed: " + r.status);
+    return await r.json();
+  };
 </script>
 <x-dc>
 <helmet>
@@ -127,7 +136,7 @@
     <button onClick="{{ toggleImport }}" style="font-family:inherit;font-size:11.5px;padding:0;border:0;background:none;color:#5c5c5c;cursor:pointer;text-decoration:underline;text-decoration-color:#cfcac5;white-space:nowrap">{{ importLabel }}</button>
     <sc-if value="{{ importOpen }}" hint-placeholder-val="{{ true }}">
       <span style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        <input type="file" accept=".sas,.egp,.txt" onChange="{{ onSasFile }}" style="font-family:inherit;font-size:11.5px;max-width:250px" />
+        <input type="file" accept=".sas,.egp,.zip,.txt" onChange="{{ onSasFile }}" style="font-family:inherit;font-size:11.5px;max-width:250px" />
         <button onClick="{{ toggleExpandMacro }}" style="font-family:inherit;font-size:11.5px;padding:4px 8px;border:1px solid {{ macroBorder }};background:{{ macroBg }};color:{{ macroFg }};cursor:pointer;white-space:nowrap" title="Expand %macro/%do/%if/&code before parsing; non-destructive and optional">{{ macroLabel }}</button>
         <span style="color:#2d2d2d">{{ sasSummary }}</span>
         <sc-if value="{{ sasSummary }}" hint-placeholder-val="{{ true }}">
@@ -142,6 +151,15 @@
     </sc-if>
     <span style="margin-left:auto;white-space:nowrap">Double-click a field to run values through the graph · ⌘/Ctrl + scroll to zoom</span>
   </div>
+
+  <sc-if value="{{ progress }}" hint-placeholder-val="{{ false }}">
+    <div style="padding:2px 26px 8px 26px;background:#f6f5f4;border-bottom:1px solid #e6e2de">
+      <div style="height:5px;background:#ece9e6;overflow:hidden">
+        <div style="height:5px;background:#d04a02;width:{{ progressPct }}%;transition:width .25s ease"></div>
+      </div>
+      <div style="font-size:11px;color:#5c5c5c;margin-top:4px">{{ progressLabel }}</div>
+    </div>
+  </sc-if>
 
   <div style="display:flex;flex:1;min-height:0">
 
@@ -432,7 +450,7 @@ class Component extends DCLogic {
     avail:0, win:1400, zoom:null, leftOpen:null, rightOpen:true,
     importOpen:false, expandMacro:false, sasSummary:'', sasText:'', sasFile:'', vals:{}, run:null,
     explain:{ field:null, text:'', src:'', busy:false, other:'' },
-    tablesNote:'', warnings:[],
+    tablesNote:'', warnings:[], progress:null,
     fileNote:'No workbook loaded — using stored sample values.' };
   mainRef = React.createRef();
   N = []; E = []; F = []; LAYERS = []; _regOrder = [];
@@ -558,19 +576,69 @@ class Component extends DCLogic {
     }
   };
 
+  _b64 = (buf) => {
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  };
+
+  _setProgress = (pct, label) => this.setState({ progress: { pct: pct, label: label } });
+  _clearProgress = (delay) => {
+    const set = this.setState.bind(this);
+    setTimeout(() => set({ progress: null }), delay || 0);
+  };
+
   onSasFile = (e) => {
     const file = e.target.files && e.target.files[0];
+    e.target.value = '';   // allow re-selecting the same file
     if (!file) return;
-    if (/\.egp$/i.test(file.name)) {
-      this.setState({ sasSummary: file.name + ' — project archive: .egp passthrough; extract the .sas programs and re-import to trace lineage.' });
+
+    if (/\.(egp|zip)$/i.test(file.name)) {
+      const r = new FileReader();
+      this.setState({ sasSummary: '', warnings: [] });
+      this._setProgress(8, 'Reading ' + file.name + '…');
+      r.onload = async () => {
+        try {
+          this._setProgress(35, 'Extracting SAS programs from ' + file.name + '…');
+          const p = await window.__importFile(file.name, this._b64(r.result), this.state.expandMacro);
+          if (p.error) throw new Error(p.error);
+          this._setProgress(80, 'Parsing lineage…');
+          const src = p.source || '';
+          const info = p.import || {};
+          const progs = (info.programs || []).length;
+          const wc = (p.warnings || []).length;
+          this.applyPayload(p);
+          this.setState({ sasText: src, sasFile: file.name });
+          this._setProgress(100, 'Rendering…');
+          this.setState({ sasSummary: file.name + ' — ' + (info.format || 'archive') + ' · extracted ' +
+            progs + ' program' + (progs === 1 ? '' : 's') + ', ' + src.length + ' chars' +
+            (wc ? ' · ⚠ ' + wc + ' parser warning' + (wc === 1 ? '' : 's') : '') + ' · lineage applied' });
+          this._clearProgress(700);
+        } catch (err) {
+          this.setState({ progress: null, sasSummary: file.name + ' — import failed: ' + err.message });
+          console.error(err);
+        }
+      };
+      r.onerror = () => this.setState({ progress: null, sasSummary: file.name + ' — could not read file' });
+      r.readAsArrayBuffer(file);
       return;
     }
+
     const r = new FileReader();
+    this.setState({ sasSummary: '', warnings: [] });
+    this._setProgress(10, 'Reading ' + file.name + '…');
     r.onload = async () => {
       const t = String(r.result);
-      this.setState({ sasText: t, sasFile: file.name });
-      this._applySasText(t, this.state.expandMacro, file.name);
+      this._setProgress(50, 'Parsing lineage…');
+      await this._applySasText(t, this.state.expandMacro, file.name);
+      this._setProgress(100, 'Rendering…');
+      this._clearProgress(500);
     };
+    r.onerror = () => this.setState({ progress: null, sasSummary: file.name + ' — could not read file' });
     r.readAsText(file);
   };
 
@@ -825,9 +893,12 @@ class Component extends DCLogic {
       macroBg: this.state.expandMacro ? '#d04a02' : '#fff', macroFg: this.state.expandMacro ? '#fff' : '#5c5c5c',
       macroBorder: this.state.expandMacro ? '#d04a02' : '#cfcac5', toggleExpandMacro: this.toggleExpandMacro,
       downloadTables: this.downloadTables, tablesNote: this.state.tablesNote,
+      progress: !!this.state.progress,
+      progressPct: this.state.progress ? this.state.progress.pct : 0,
+      progressLabel: this.state.progress ? this.state.progress.label : '',
       warnLabel: this.state.warnings.length ? ('⚠ ' + this.state.warnings.length + ' parser warning' + (this.state.warnings.length === 1 ? '' : 's') + ' — lineage may be incomplete') : '',
       warnText: this.state.warnings.slice(0, 12).map(w => 'line ' + (w.line || '?') + ': ' + w.message).join('\n'),
-      onSasFile:this.onSasFile, clearSas: () => this.setState({ sasSummary:'', sasText:'', sasFile:'', tablesNote:'', warnings:[] }), onDataFile:this.onDataFile,
+      onSasFile:this.onSasFile, clearSas: () => this.setState({ sasSummary:'', sasText:'', sasFile:'', tablesNote:'', warnings:[], progress:null }), onDataFile:this.onDataFile,
       upBg: dir === 'up' ? P.rose : '#fff', upFg: dir === 'up' ? '#fff' : P.ink,
       bothBg: dir === 'both' ? P.ink : '#fff', bothFg: dir === 'both' ? '#fff' : P.ink,
       downBg: dir === 'down' ? P.tang : '#fff', downFg: dir === 'down' ? '#fff' : P.ink,

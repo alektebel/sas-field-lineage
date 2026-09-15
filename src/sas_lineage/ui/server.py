@@ -7,6 +7,9 @@ Endpoints
 GET  /             -> explorer.html (the web app)
 GET  /api/demo     -> payload for the bundled demo SAS program
 POST /api/parse    -> {"code": "...", "expand_macros": false} -> payload for that SAS program
+POST /api/import   -> {"filename": "...", "content_b64": "...", "expand_macros": false}
+                      -> payload for an uploaded .egp/archive, plus "source" (the
+                         extracted SAS) and "import" ({format, programs, chars})
 POST /api/run      -> {"field": "table.name", "vals": {...}} -> per-hop value rows
 GET  /api/tables   -> persistent-library table inventory for the last parsed program
 POST /api/tables   -> {"code": "..."} -> persistent-library table inventory
@@ -29,6 +32,8 @@ Run:
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import io
 import json
 import mimetypes
@@ -42,7 +47,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-from ..parser import SASParser
+from ..parser import SASParser, extract_sas
 from ..parser.preprocessor import expand_for_report
 from ..report import build_inventory, inventory_sheets, write_xlsx
 from .facts import FieldFacts, SYSTEM_PROMPT, make_question, user_message
@@ -107,6 +112,27 @@ def _parse(code: str, expand_macros: bool = False) -> Dict[str, Any]:
         _index = ProgramIndex(_program)
         _facts = FieldFacts(_program)
         return build_payload(_program)
+
+
+def _import(filename: str, content_b64: str, expand_macros: bool = False) -> Dict[str, Any]:
+    """Extract SAS from an uploaded .egp/archive and parse it for lineage."""
+    try:
+        data = base64.b64decode(content_b64, validate=False)
+    except (binascii.Error, ValueError) as exc:
+        return {"error": f"Invalid upload: {exc}"}
+    source, info = extract_sas(data)
+    info = dict(info)
+    info["filename"] = filename
+    payload = _parse(source, expand_macros)
+    payload["source"] = source
+    payload["import"] = info
+    if not source.strip():
+        payload.setdefault("warnings", []).insert(0, {
+            "message": f"No SAS code found in '{filename or 'upload'}' "
+                       f"(detected format: {info.get('format', 'unknown')}).",
+            "line": None, "statement": None, "kind": "import",
+        })
+    return payload
 
 
 def _parse_warnings(code: str) -> list:
@@ -279,6 +305,20 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             payload = _parse(code, bool(body.get("expand_macros", False)))
             self._send_json(200, payload)
+        elif parsed.path == "/api/import":
+            body = self._read_body()
+            content = str(body.get("content_b64") or "")
+            if not content:
+                self._send_json(400, {"error": "Missing 'content_b64'"})
+                return
+            result = _import(
+                str(body.get("filename") or ""), content,
+                bool(body.get("expand_macros", False)),
+            )
+            if "error" in result and "source" not in result:
+                self._send_json(400, result)
+                return
+            self._send_json(200, result)
         elif parsed.path == "/api/tables":
             self._send_json(200, _tables(self._code_for(self._read_body())))
         elif parsed.path == "/api/tables.xlsx":

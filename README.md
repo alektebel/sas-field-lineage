@@ -67,8 +67,13 @@ What the explorer gives you:
 3. **Value at every hop** — enter the golden inputs (or upload a contract-cycle
    workbook) and the app runs the value forward, showing the value at each hop
    and the graph highlighting the path and contributing sources.
-4. **Live parsing** — import a `.sas` source in the header and the whole view
-   re-renders from the freshly parsed program.
+4. **Live parsing (incl. `.egp`)** — import a `.sas`/`.txt` source or a SAS
+   Enterprise Guide `.egp` project in the header and the whole view re-renders
+   from the freshly parsed program. `.egp` uploads are unpacked automatically:
+   ZIP-based projects (`programs/*.sas`) are read directly, native OLE compound
+   documents are scanned stream-by-stream, and anything else falls back to a
+   UTF-8/UTF-16 byte scan that keeps only contiguous `DATA`/`PROC`/`%macro`
+   blocks. A progress bar tracks read → extract → parse → render.
 5. **Persistent-library table report** — the **Download persistent tables
    (.xlsx)** button exports every table written to a persistent (non-`WORK`)
    SAS library: the `LIBNAME` it landed in (with engine/path), the step that
