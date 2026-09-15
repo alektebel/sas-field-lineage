@@ -96,6 +96,16 @@ class TestInventory(unittest.TestCase):
         self.assertEqual(names, {"otherlib.t"})
         self.assertFalse(inv["tables"][0]["declared_library"])
 
+    def test_macro_used_before_definition_is_reported(self):
+        code = "%build(mrt)\n%macro build(lib);\ndata &lib..t; set src; run;\n%mend;\n"
+        names, inv = self._names(code)
+        self.assertEqual(names, {"mrt.t"})
+
+    def test_forward_let_chain_resolves_library(self):
+        code = "%let a=&b;\n%let b=&c;\n%let c=mrt;\ndata &a..t; set src; run;\n"
+        names, _ = self._names(code)
+        self.assertEqual(names, {"mrt.t"})
+
     def test_expand_disabled_keeps_raw_names(self):
         code = "%let p = clm;\ndata mrt.&p._1; set x; run;\n"
         inv = build_inventory(code, expand=False)
@@ -164,14 +174,38 @@ class TestXlsxWriter(unittest.TestCase):
         self.assertEqual(_col_letter(27), "AA")
         self.assertEqual(_col_letter(28), "AB")
 
-    def test_inventory_sheets_shape(self):
-        inv = build_inventory("libname mrt 'x';\ndata mrt.t; set a; x=1; run;\n")
+    def test_inventory_sheets_group_by_division(self):
+        inv = build_inventory("libname mrt 'x';\ndata mrt.t; set raw.src; x=1; run;\n")
         sheets = inventory_sheets(inv)
         names = [name for name, _rows in sheets]
-        self.assertEqual(names, ["Persistent tables", "Libraries", "Summary"])
-        header = sheets[0][1][0]
-        self.assertIn("Library", header)
-        self.assertIn("Table", header)
+        self.assertIn("Libraries", names)
+        self.assertIn("Summary", names)
+        # one hop from its source -> Landing division sheet
+        self.assertIn("Landing", names)
+        div_sheet = next(rows for name, rows in sheets if name == "Landing")
+        self.assertIn("Division", div_sheet[0])
+        self.assertIn("Library", div_sheet[0])
+        self.assertIn("Table", div_sheet[0])
+
+    def test_multi_stage_flow_creates_multiple_division_sheets(self):
+        code = (
+            "libname mrt 'x';\n"
+            "data mrt.stg; set golden.src; a = 1; run;\n"
+            "data mrt.mart; set mrt.stg; b = a + 1; run;\n"
+            "data mrt.rep; set mrt.mart; c = b + 1; run;\n"
+        )
+        inv = build_inventory(code)
+        divisions = [d["name"] for d in inv["divisions"]]
+        # Only persistent writes are reported, so the golden input has no sheet.
+        self.assertEqual(divisions, ["Landing", "Curated", "Marts"])
+        by_name = {t["name"]: t["division"] for t in inv["tables"]}
+        self.assertEqual(by_name["mrt.stg"], "Landing")
+        self.assertEqual(by_name["mrt.mart"], "Curated")
+        self.assertEqual(by_name["mrt.rep"], "Marts")
+        names = [name for name, _rows in inventory_sheets(inv)]
+        self.assertIn("All tables", names)
+        for division in divisions:
+            self.assertIn(division, names)
 
 
 if __name__ == "__main__":

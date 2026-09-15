@@ -114,6 +114,22 @@ class TestMacroPreprocessor(unittest.TestCase):
         prog = self.parser.parse(code, expand_macros=True)
         self.assertEqual([d.output_table for d in prog.data_steps], ["d_x", "d_y", "d_z"])
 
+    def test_macro_used_before_definition(self):
+        code = "%build(mrt)\n%macro build(lib);\ndata &lib..t; set s; run;\n%mend;\n"
+        prog = self.parser.parse(code, expand_macros=True)
+        self.assertEqual([d.output_table for d in prog.data_steps], ["mrt"])
+
+    def test_let_chain_forward_reference(self):
+        code = "%let a=&b;\n%let b=&c;\n%let c=mrt;\ndata &a..t; set s; run;\n"
+        prog = self.parser.parse(code, expand_macros=True)
+        self.assertEqual([d.output_table for d in prog.data_steps], ["mrt"])
+
+    def test_let_inside_macro_is_not_folded_into_globals(self):
+        code = ("%macro go;\n%let w = runtime;\ndata d_&w; set s; run;\n%mend;\n"
+                "%go\n")
+        prog = self.parser.parse(code, expand_macros=True)
+        self.assertEqual([d.output_table for d in prog.data_steps], ["d_runtime"])
+
     def test_include_is_opt_in_and_sandboxed(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)

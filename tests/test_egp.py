@@ -65,6 +65,19 @@ class TestEgpExtraction(unittest.TestCase):
         self.assertIn("data mrt.t", source)
         self.assertGreater(info["chars"], 0)
 
+    def test_zip_programs_keep_archive_order_for_cross_file_macros(self):
+        use = "%mk(mrt)\n"
+        definition = "%macro mk(lib);\ndata &lib..t; set src; run;\n%mend;\n"
+        data = _make_zip({
+            "programs/01_use.sas": use,
+            "programs/02_def.sas": definition,
+        })
+        source, info = extract_sas(data)
+        self.assertEqual(info["programs"], ["programs/01_use.sas", "programs/02_def.sas"])
+        from src.sas_lineage.parser import SASParser
+        program = SASParser().parse(source, expand_macros=True)
+        self.assertEqual([d.output_table for d in program.data_steps], ["mrt"])
+
     def test_garbage_yields_no_source(self):
         source, info = extract_sas(b"\x00\x01\x02 not sas at all")
         self.assertEqual(source, "")

@@ -252,7 +252,8 @@ def _eval_cond(expr: str, resolve) -> bool:
 
 
 class MacroPreprocessor:
-    def __init__(self, include_base: Optional[str] = None, preserve_unknown: bool = False):
+    def __init__(self, include_base: Optional[str] = None, preserve_unknown: bool = False,
+                 topological: bool = True):
         self.macros: Dict[str, Dict] = {}
         self.symbols: Dict[str, str] = {}
         self.include_base = include_base
@@ -260,13 +261,110 @@ class MacroPreprocessor:
         # instead of collapsing to an empty string. Used by the persistent-
         # table report so unresolved library/prefix names can be flagged.
         self.preserve_unknown = preserve_unknown
+        # When True, every %macro definition and %let value is collected up
+        # front and the symbols resolved in dependency (topological) order, so
+        # a macro or prefix used before its definition -- common across the
+        # programs of one EGP -- is still expanded.
+        self.topological = topological
         self._include_seen: set = set()
 
     # ------------------------------------------------------------------ #
     def preprocess(self, code: str, include_base: Optional[str] = None) -> str:
         self.include_base = include_base or self.include_base
         code = _strip_macro_comments(code)
+        if self.topological:
+            self._preload(code)
         return self._expand(code, self.symbols, depth=0)
+
+    # ---- topological pre-pass ----------------------------------------- #
+    def _preload(self, text: str) -> None:
+        """Register all macros and resolve all ``%let`` values up front.
+
+        A SAS program (or an EGP made of several programs) may use a macro or a
+        symbol before the line that defines it; expanding strictly left to
+        right then loses the generated steps. Registering every definition and
+        resolving symbol values in dependency order makes the later linear pass
+        able to substitute them wherever they appear.
+        """
+        self._register_macros(text)
+        self._resolve_globals(text)
+
+    def _register_macros(self, text: str) -> None:
+        i = 0
+        while i < len(text):
+            match = re.search(r"%\s*macro\b", text[i:], re.IGNORECASE)
+            if not match:
+                break
+            start = i + match.start()
+            spec_end = text.find(";", start)
+            if spec_end == -1:
+                break
+            spec = text[i + match.end():spec_end].strip()
+            def_end = _matching_mend(text, start)
+            if def_end <= start:
+                break
+            body = text[spec_end + 1:def_end]
+            mend_at = body.lower().rfind("%mend")
+            if mend_at != -1:
+                body = body[:mend_at]
+            header = re.match(r"([A-Za-z_]\w*)\s*(?:\((.*)\))?$", spec, flags=re.S)
+            if header:
+                self.macros[header.group(1).lower()] = {
+                    "params": _parse_params(header.group(2) or ""),
+                    "body": body,
+                }
+            i = def_end
+
+    @staticmethod
+    def _mask_macro_bodies(text: str) -> str:
+        """Blank out ``%macro ... %mend`` bodies, preserving offsets.
+
+        ``%let`` statements inside a macro are runtime-local and must not be
+        folded into the global symbol table.
+        """
+        masked = list(text)
+        i = 0
+        while i < len(text):
+            match = re.search(r"%\s*macro\b", text[i:], re.IGNORECASE)
+            if not match:
+                break
+            start = i + match.start()
+            end = _matching_mend(text, start)
+            if end <= start:
+                break
+            for j in range(start, min(end, len(masked))):
+                if masked[j] != "\n":
+                    masked[j] = " "
+            i = end
+        return "".join(masked)
+
+    def _resolve_globals(self, text: str) -> None:
+        """Resolve ``%let`` values in dependency order (DFS topological sort)."""
+        latest: Dict[str, str] = {}
+        for match in _LET_STMT_RE.finditer(self._mask_macro_bodies(text)):
+            latest[match.group(1).lower()] = match.group(2).strip()
+        if not latest:
+            return
+        visiting: set = set()
+        done: set = set()
+
+        def resolve(name: str) -> None:
+            if name in done or name in visiting or name not in latest:
+                return
+            visiting.add(name)
+            for dep_match in _SYMREF_RE.finditer(latest[name]):
+                resolve(dep_match.group(2).lower())
+            try:
+                value = self._expand(latest[name], dict(self.symbols), depth=0)
+            except Exception:
+                value = latest[name]
+            self.symbols.setdefault(name, value)
+            visiting.discard(name)
+            done.add(name)
+
+        for name in list(latest):
+            resolve(name)
+
 
     # ---- symbol resolution ------------------------------------------- #
     def _read_symref(self, text: str, amp_idx: int, scope: Dict[str, str]):

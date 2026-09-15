@@ -100,6 +100,9 @@ class PersistentTable:
     lib_engine: str = ""
     lib_path: str = ""
     declared: bool = False
+    # Data-flow stage this table belongs to ("division"/flux).
+    division: str = ""
+    division_col: int = 0
 
     @property
     def name(self) -> str:
@@ -107,6 +110,8 @@ class PersistentTable:
 
     def to_dict(self) -> Dict[str, object]:
         return {
+            "division": self.division,
+            "division_col": self.division_col,
             "library": self.library,
             "table": self.table,
             "name": self.name,
@@ -167,6 +172,60 @@ def _data_targets(rest: str) -> List[str]:
         if _DATASET_TOKEN_RE.match(token):
             out.append(token)
     return out
+
+
+# Pipeline stages a table can land in, mirroring the explorer's registers.
+_DIVISION_LABELS = ["Golden sources", "Landing", "Curated", "Marts", "Reporting"]
+
+
+def _division_label(col: int) -> str:
+    if 0 <= col < len(_DIVISION_LABELS):
+        return _DIVISION_LABELS[col]
+    return f"Stage {col + 1}"
+
+
+def _split_inputs(inputs: str) -> List[str]:
+    return [token.strip() for token in re.split(r"[,\s]+", inputs or "") if token.strip()]
+
+
+def _assign_divisions(rows: List["PersistentTable"]) -> List[Dict[str, object]]:
+    """Assign each table a division from its position in the data-flow graph.
+
+    Edges run from every input table to the table it feeds; a table's division
+    is its longest distance from a source, i.e. the "flux" stage it appears in.
+    """
+    producers: Dict[str, set] = {}
+    for row in rows:
+        for source in _split_inputs(row.input_tables):
+            if source.lower() == row.name.lower():
+                continue
+            producers.setdefault(row.name, set()).add(source)
+
+    column: Dict[str, int] = {}
+
+    def longest(name: str, seen: set) -> int:
+        if name in column:
+            return column[name]
+        if name in seen:
+            return 0
+        seen = seen | {name}
+        best = 0
+        for parent in producers.get(name, ()):
+            best = max(best, 1 + longest(parent, seen))
+        column[name] = best
+        return best
+
+    for row in rows:
+        longest(row.name, set())
+
+    counts: Dict[str, Dict[str, object]] = {}
+    for row in rows:
+        col = column.get(row.name, 0)
+        row.division_col = col
+        row.division = _division_label(col)
+        entry = counts.setdefault(row.division, {"name": row.division, "col": col, "count": 0})
+        entry["count"] = int(entry["count"]) + 1
+    return sorted(counts.values(), key=lambda e: (int(e["col"]), str(e["name"])))
 
 
 def _split_persistent(target: str) -> Optional[Tuple[str, str]]:
@@ -349,7 +408,9 @@ def build_inventory(
             continue
         seen.add(key)
         tables.append(row)
-    tables.sort(key=lambda r: (r.library.lower(), r.table.lower(), r.source_line or 0))
+    divisions = _assign_divisions(tables)
+    tables.sort(key=lambda r: (r.division_col, r.library.lower(), r.table.lower(),
+                               r.source_line or 0))
 
     declared = [ref for ref in libraries.values() if ref.declared]
     stats = {
@@ -358,16 +419,19 @@ def build_inventory(
         "declared_libraries": len(declared),
         "macro_built": sum(1 for r in tables if r.macro_built),
         "unresolved": sum(1 for r in tables if not r.resolved),
+        "divisions": len(divisions),
     }
     return {
         "libraries": [ref.to_dict() for ref in sorted(libraries.values(),
                                                        key=lambda r: r.libref.lower())],
         "tables": [row.to_dict() for row in tables],
+        "divisions": divisions,
         "stats": stats,
     }
 
 
 _TABLE_COLUMNS = [
+    ("division", "Division"),
     ("library", "Library"),
     ("table", "Table"),
     ("name", "Name"),
@@ -399,15 +463,26 @@ def inventory_rows(inventory: Dict[str, object]) -> List[List[object]]:
     return rows
 
 
+def _rows_for_tables(tables: List[Dict[str, object]]) -> List[List[object]]:
+    return [[label for _key, label in _TABLE_COLUMNS]] + [
+        [_cell(table.get(key)) for key, _label in _TABLE_COLUMNS] for table in tables
+    ]
+
+
 def inventory_sheets(
     inventory: Dict[str, object],
     warnings: Optional[List[Dict[str, object]]] = None,
 ) -> List[Tuple[str, List[List[object]]]]:
-    """Workbook sheets: ``Persistent tables``, ``Libraries``, ``Summary``.
+    """Workbook sheets grouped by flux/division.
 
-    ``warnings`` are optional parser warnings; when present a ``Parser
-    warnings`` sheet is added and its count is surfaced on the summary.
+    The tables are **separated by the data-flow division they appear in**
+    (Golden sources -> Landing -> Curated -> Marts -> Reporting): one worksheet
+    per division, plus a combined ``All tables`` sheet when there is more than
+    one, then ``Libraries``, ``Summary`` and (optionally) ``Parser warnings``.
     """
+    tables: List[Dict[str, object]] = list(inventory.get("tables", []))  # type: ignore[arg-type]
+    divisions = list(inventory.get("divisions", []))  # type: ignore[arg-type]
+
     lib_rows: List[List[object]] = [[label for _key, label in _LIBRARY_COLUMNS]]
     for ref in inventory.get("libraries", []):  # type: ignore[union-attr]
         lib_rows.append([_cell(ref.get(key)) for key, _label in _LIBRARY_COLUMNS])
@@ -418,6 +493,7 @@ def inventory_sheets(
         ("tables", "Persistent tables"),
         ("libraries", "Libraries referenced"),
         ("declared_libraries", "Libraries declared with LIBNAME"),
+        ("divisions", "Flow divisions"),
         ("macro_built", "Tables built from macros"),
         ("unresolved", "Unresolved macro names"),
     ):
@@ -425,11 +501,17 @@ def inventory_sheets(
     if warnings is not None:
         summary.append(["Parser warnings", len(warnings)])
 
-    sheets: List[Tuple[str, List[List[object]]]] = [
-        ("Persistent tables", inventory_rows(inventory)),
-        ("Libraries", lib_rows),
-        ("Summary", summary),
-    ]
+    sheets: List[Tuple[str, List[List[object]]]] = []
+    if not divisions:
+        sheets.append(("Persistent tables", _rows_for_tables(tables)))
+    elif len(divisions) > 1:
+        sheets.append(("All tables", _rows_for_tables(tables)))
+    for division in divisions:
+        name = str(division.get("name", ""))
+        members = [t for t in tables if str(t.get("division", "")) == name]
+        sheets.append((name, _rows_for_tables(members)))
+    sheets.append(("Libraries", lib_rows))
+    sheets.append(("Summary", summary))
     if warnings:
         warn_rows: List[List[object]] = [["Kind", "Line", "Message", "Statement"]]
         for w in warnings:

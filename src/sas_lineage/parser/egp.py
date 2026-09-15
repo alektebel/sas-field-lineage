@@ -210,7 +210,9 @@ def _from_zip(data: bytes) -> Tuple[str, Dict[str, object]] | None:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             names = archive.namelist()
-            sas_names = sorted(n for n in names if n.lower().endswith(".sas"))
+            # Keep the archive (start-to-finish) order: an EGP's programs may
+            # define a macro in one program and use it in a later one.
+            sas_names = [n for n in names if n.lower().endswith(".sas")]
             if sas_names:
                 parts = [_decode(archive.read(n)) for n in sas_names]
                 source = "\n\n".join(p for p in parts if p.strip())
