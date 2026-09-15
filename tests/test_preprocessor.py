@@ -15,8 +15,9 @@ class TestMacroPreprocessor(unittest.TestCase):
     def test_let_and_symbol_resolution(self):
         code = "%let lib = stg;\ndata &lib..raw;\n  set &lib..src;\n  y = 100;\nrun;\n"
         prog = self.parser.parse(code, expand_macros=True)
-        self.assertEqual(prog.data_steps[0].output_table, "stg")
-        self.assertIn("stg", prog.data_steps[0].input_tables)
+        # The library-qualified table is kept whole, not truncated to the libref.
+        self.assertEqual(prog.data_steps[0].output_table, "stg.raw")
+        self.assertIn("stg.src", prog.data_steps[0].input_tables)
 
     def test_macro_loop_generates_data_steps(self):
         code = """
@@ -117,12 +118,12 @@ class TestMacroPreprocessor(unittest.TestCase):
     def test_macro_used_before_definition(self):
         code = "%build(mrt)\n%macro build(lib);\ndata &lib..t; set s; run;\n%mend;\n"
         prog = self.parser.parse(code, expand_macros=True)
-        self.assertEqual([d.output_table for d in prog.data_steps], ["mrt"])
+        self.assertEqual([d.output_table for d in prog.data_steps], ["mrt.t"])
 
     def test_let_chain_forward_reference(self):
         code = "%let a=&b;\n%let b=&c;\n%let c=mrt;\ndata &a..t; set s; run;\n"
         prog = self.parser.parse(code, expand_macros=True)
-        self.assertEqual([d.output_table for d in prog.data_steps], ["mrt"])
+        self.assertEqual([d.output_table for d in prog.data_steps], ["mrt.t"])
 
     def test_let_inside_macro_is_not_folded_into_globals(self):
         code = ("%macro go;\n%let w = runtime;\ndata d_&w; set s; run;\n%mend;\n"

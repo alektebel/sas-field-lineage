@@ -76,7 +76,7 @@ class TestEgpExtraction(unittest.TestCase):
         self.assertEqual(info["programs"], ["programs/01_use.sas", "programs/02_def.sas"])
         from src.sas_lineage.parser import SASParser
         program = SASParser().parse(source, expand_macros=True)
-        self.assertEqual([d.output_table for d in program.data_steps], ["mrt"])
+        self.assertEqual([d.output_table for d in program.data_steps], ["mrt.t"])
 
     def test_garbage_yields_no_source(self):
         source, info = extract_sas(b"\x00\x01\x02 not sas at all")

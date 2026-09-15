@@ -50,7 +50,6 @@ class SASParser:
     def __init__(self):
         self.current_line = 0
         self._warned: set = set()
-        self._two_level = 0
         self._top_unrecognized: List[Tuple[str, str, int]] = []
 
     def _warn(self, program: SASProgram, message: str, line: Optional[int],
@@ -102,7 +101,6 @@ class SASParser:
         """
         program = SASProgram()
         self._warned = set()
-        self._two_level = 0
         self._top_unrecognized = []
         if expand_macros:
             sas_code = preprocess(sas_code, include_base=include_base)
@@ -132,13 +130,6 @@ class SASParser:
             i += 1
 
         self._flush_unrecognized(program)
-        if self._two_level:
-            self._warn(
-                program,
-                f"{self._two_level} library-qualified name(s) (lib.table) found; field lineage is "
-                f"library-agnostic and the persistent-tables report keeps the library",
-                None, None, kind="two-level-name", key=("two-level",),
-            )
         ignored = len(self._top_unrecognized)
         program.stats = {
             "statements": total,
@@ -230,9 +221,9 @@ class SASParser:
         # Permissive: capture ``lib.table``, ``&macro.name`` or ``%name`` too.
         target_match = re.search(r'DATA\s+([^\s;]+)', text, re.IGNORECASE)
         full_target = target_match.group(1) if target_match else ""
-        output_table = full_target.split('.')[0]
-        if "." in full_target:
-            self._two_level += 1
+        # Keep the full ``lib.table`` name so the table is not mistaken for its
+        # library (``lib.C111_tabla`` must not become just ``lib``).
+        output_table = full_target
         if not output_table and program is not None:
             self._warn(program, f"Could not read the DATA target: '{text[:80]}'",
                        line, text, kind="data-target")
@@ -270,12 +261,12 @@ class SASParser:
                 set_match = re.search(r'SET\s+([\w.\s]+)', stmt, re.IGNORECASE)
                 if set_match:
                     data_step.input_tables.extend(
-                        t.split('.')[0] for t in set_match.group(1).split() if t.strip())
+                        t for t in set_match.group(1).split() if t.strip())
             elif upper.startswith('MERGE '):
                 merge_match = re.search(r'MERGE\s+([\w.\s]+)', stmt, re.IGNORECASE)
                 if merge_match:
                     data_step.input_tables.extend(
-                        t.split('.')[0] for t in merge_match.group(1).split() if t.strip())
+                        t for t in merge_match.group(1).split() if t.strip())
             elif upper.startswith('BY '):
                 by_match = re.search(r'BY\s+([\w\s]+)', stmt, re.IGNORECASE)
                 if by_match:
@@ -342,7 +333,6 @@ class SASParser:
             return None, self._skip_step(stmts, start_line)
 
         proc_step = ProcStepNode(proc_name=proc_name)
-        self._note_two_level(text)
 
         i = start_line + 1
         terminated = False
@@ -364,17 +354,16 @@ class SASParser:
                     )
                 break
 
-            # Extract DATA= option
+            # Extract DATA= option (keep the full lib.table name)
             data_match = re.search(r'DATA\s*=\s*([\w.]+)', stmt, re.IGNORECASE)
             if data_match:
-                proc_step.input_table = data_match.group(1).split('.')[0]
+                proc_step.input_table = data_match.group(1)
 
-            # Extract OUT= option
+            # Extract OUT= option (keep the full lib.table name)
             out_match = re.search(r'OUT\s*=\s*([\w.]+)', stmt, re.IGNORECASE)
             if out_match:
-                proc_step.output_table = out_match.group(1).split('.')[0]
+                proc_step.output_table = out_match.group(1)
 
-            self._note_two_level(stmt)
             i += 1
 
         if not terminated and program is not None:
@@ -399,11 +388,6 @@ class SASParser:
             i += 1
         return i
 
-    def _note_two_level(self, stmt: str) -> None:
-        """Count library-qualified (``lib.table``) references without warning."""
-        for match in re.finditer(r'\b(?:DATA|OUT|OUTPUT|BASE)\s*=\s*[A-Za-z_]\w*\.\w+', stmt, re.IGNORECASE):
-            self._two_level += 1
-    
     def _extract_field_references(self, expression: str, source_tables: List[str]) -> List[Tuple[str, Optional[str]]]:
         """
         Extract field references from an expression

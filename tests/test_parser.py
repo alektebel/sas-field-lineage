@@ -60,6 +60,12 @@ class TestSASParser(unittest.TestCase):
         self.assertIn('table2', data_step.input_tables)
         self.assertEqual(data_step.merge_keys, ['id'])
     
+    def test_library_qualified_target_kept_whole(self):
+        sas_code = "DATA work.contracts; SET raw.contracts; x = 1; RUN;"
+        program = self.parser.parse(sas_code)
+        self.assertEqual(program.data_steps[0].output_table, "work.contracts")
+        self.assertIn("raw.contracts", program.data_steps[0].input_tables)
+
     def test_multiple_data_steps(self):
         """Test parsing multiple DATA steps"""
         sas_code = """
@@ -159,10 +165,11 @@ class TestParseWarnings(unittest.TestCase):
         # the following step is still parsed
         self.assertEqual([d.output_table for d in self.parser.parse(code).data_steps], ["a", "b"])
 
-    def test_two_level_name_warns(self):
+    def test_two_level_name_is_kept_and_not_warned(self):
         code = "data mrt.out; set mrt.src; x = 1; run;\n"
-        warnings = self.parser.parse(code).get_warnings()
-        self.assertTrue(any(w["kind"] == "two-level-name" for w in warnings))
+        program = self.parser.parse(code)
+        self.assertEqual(program.data_steps[0].output_table, "mrt.out")
+        self.assertNotIn("two-level-name", {w["kind"] for w in program.get_warnings()})
 
     def test_unknown_top_level_statement_warns(self):
         code = "FOOBAR something;\ndata out; set src; x = 1; run;\n"

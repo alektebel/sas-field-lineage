@@ -96,6 +96,15 @@ class TestInventory(unittest.TestCase):
         self.assertEqual(names, {"otherlib.t"})
         self.assertFalse(inv["tables"][0]["declared_library"])
 
+    def test_prefixed_two_level_target_resolves(self):
+        code = ("%let prefijo_output = LIBNAME.C111;\n"
+                "data &prefijo_output._tabla; set src.a; x = 1; run;\n"
+                "proc sql; create table &prefijo_output._tabla2 as select * from src.b; quit;\n")
+        names, inv = self._names(code)
+        self.assertEqual(names, {"LIBNAME.C111_tabla", "LIBNAME.C111_tabla2"})
+        row = next(t for t in inv["tables"] if t["table"] == "C111_tabla")
+        self.assertEqual(row["library"], "LIBNAME")
+
     def test_macro_used_before_definition_is_reported(self):
         code = "%build(mrt)\n%macro build(lib);\ndata &lib..t; set src; run;\n%mend;\n"
         names, inv = self._names(code)
