@@ -151,6 +151,44 @@ class TestMacroPreprocessor(unittest.TestCase):
         expanded = preprocess('%let suffix=old; %let suffix=; data out&suffix.; run;')
         self.assertIn('data out;', expanded)
 
+    def test_mdy_intnx_monthly_while_loop(self):
+        code = """
+        %macro batch(start_dt, end_dt);
+          %let iter_dt = &start_dt;
+          %do %while(&iter_dt <= &end_dt);
+            data work.m_%sysfunc(intnx(month, &iter_dt, 0, same), yymmn6.);
+              set src;
+            run;
+            %let iter_dt = %sysfunc(intnx(month, &iter_dt, 1, same));
+          %end;
+        %mend;
+        %batch(%sysfunc(mdy(1,1,2023)), %sysfunc(mdy(3,1,2023)));
+        """
+        prog = self.parser.parse(code, expand_macros=True)
+        self.assertEqual(
+            [d.output_table for d in prog.data_steps],
+            ["work.m_202301", "work.m_202302", "work.m_202303"],
+        )
+
+    def test_until_loop_stops_when_iterator_stuck(self):
+        # Synthetic macros sometimes omit the iterator update; do not spin forever.
+        code = """
+        %macro stuck(start_dt, end_dt);
+          %let valid_dt = &start_dt;
+          %do %until (%sysfunc(intnx(month, &valid_dt, 1, e)) > &end_dt);
+            data work.once; set src; run;
+          %end;
+        %mend;
+        %stuck('01JAN2023'd, '31DEC2023'd);
+        """
+        prog = self.parser.parse(code, expand_macros=True)
+        self.assertEqual([d.output_table for d in prog.data_steps], ["work.once"])
+
+    def test_date_literal_compare(self):
+        from src.sas_lineage.parser.preprocessor import _numeric, _parse_date_literal
+        self.assertEqual(_parse_date_literal("'01JAN1960'd"), 0)
+        self.assertEqual(_numeric("'02JAN1960'd"), 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

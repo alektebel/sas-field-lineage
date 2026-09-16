@@ -21,14 +21,18 @@ Supported:
   %eval %sysevalf %scan %index %substr %length %trim %left %upcase %downcase
   %cmpres %cats %catx %str %nrstr %bquote %quote %unquote
   %sysfunc(countw/count/length/find/sum/min/max/int/floor/ceil/round/abs/sqrt/...)
+  %sysfunc(mdy/date/today/intnx/intck/day/month/year) with optional putn-style format
+  SAS date literals ('01JAN2023'd) in comparisons and %sysfunc args
 """
 
 from __future__ import annotations
 
 import ast
+import calendar
 import math
 import operator
 import re
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from .scanner import quoted_end, strip_comments
@@ -55,6 +59,18 @@ _ARITH_OPS = {
 
 _MAX_DEPTH = 40
 _MAX_ITERS = 40000
+# Monthly regulatory loops rarely need more than ~20 years; keep this far below
+# the old 2000-iteration default so a stuck %while/%until cannot emit hundreds of MB.
+_MAX_WHILE_ITERS = 240
+
+_SAS_EPOCH = date(1960, 1, 1)
+_MONTH_ABBR = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+_DATE_LITERAL_RE = re.compile(
+    r"^['\"](\d{1,2})([A-Za-z]{3})(\d{2,4})['\"]d$", re.IGNORECASE
+)
 
 
 def _strip_macro_comments(text: str) -> str:
@@ -150,8 +166,88 @@ def _split_commas(text: str) -> List[str]:
     return parts
 
 
+def _to_sas_date(d: date) -> int:
+    return (d - _SAS_EPOCH).days
+
+
+def _from_sas_date(n: float) -> date:
+    return _SAS_EPOCH + timedelta(days=int(n))
+
+
+def _parse_date_literal(s: str) -> Optional[int]:
+    m = _DATE_LITERAL_RE.match(str(s).strip())
+    if not m:
+        return None
+    day = int(m.group(1))
+    mon = _MONTH_ABBR.get(m.group(2).upper())
+    year = int(m.group(3))
+    if mon is None:
+        return None
+    if year < 100:
+        year += 2000 if year < 50 else 1900
+    try:
+        return _to_sas_date(date(year, mon, day))
+    except ValueError:
+        return None
+
+
+def _format_sas_date(n: float, fmt: Optional[str]) -> str:
+    """Format a SAS date value; unknown formats fall back to the numeric day."""
+    try:
+        d = _from_sas_date(n)
+    except Exception:
+        return _fmt_num(n)
+    key = (fmt or "").upper().rstrip(".")
+    if key in ("YYMMN6", "YYMMN"):
+        return f"{d.year:04d}{d.month:02d}"
+    if key in ("YYMMDD10", "YYMMDDD10"):
+        return d.isoformat()
+    if key in ("YYMMDD8", "YYMMDDN8"):
+        return f"{d.year:04d}{d.month:02d}{d.day:02d}"
+    if key in ("DATE9",):
+        return f"{d.day:02d}{d.strftime('%b').upper()}{d.year:04d}"
+    return _fmt_num(n)
+
+
+def _intnx(interval: str, start: float, increment: float, alignment: str = "same") -> Optional[float]:
+    """Subset of SAS INTNX for month/year/day intervals used by monthly batches."""
+    try:
+        d = _from_sas_date(start)
+        n = int(increment)
+    except Exception:
+        return None
+    unit = interval.strip().lower().strip("'\"")
+    align = (alignment or "same").strip().lower().strip("'\"")
+    if unit in ("month", "months", "month."):
+        total = d.year * 12 + (d.month - 1) + n
+        year, month0 = divmod(total, 12)
+        month = month0 + 1
+        last = calendar.monthrange(year, month)[1]
+        if align in ("beginning", "b", "begin"):
+            day = 1
+        elif align in ("end", "e"):
+            day = last
+        else:  # same / s / middle-ish: clamp day
+            day = min(d.day, last)
+        return _to_sas_date(date(year, month, day))
+    if unit in ("year", "years", "year."):
+        year = d.year + n
+        last = calendar.monthrange(year, d.month)[1]
+        if align in ("beginning", "b", "begin"):
+            return _to_sas_date(date(year, 1, 1))
+        if align in ("end", "e"):
+            return _to_sas_date(date(year, 12, 31))
+        return _to_sas_date(date(year, d.month, min(d.day, last)))
+    if unit in ("day", "days", "day."):
+        return _to_sas_date(d + timedelta(days=n))
+    return None
+
+
 def _numeric(v) -> Optional[float]:
     s = str(v).strip().replace(",", "")
+    lit = _parse_date_literal(s)
+    if lit is not None:
+        return float(lit)
     if re.fullmatch(r"-?\d+", s):
         return float(int(s))
     if re.fullmatch(r"-?\d+\.?\d*(?:[eE][+-]?\d+)?", s):
@@ -187,6 +283,9 @@ def _fmt_num(x) -> str:
 
 
 def _side(v: str):
+    n = _numeric(v)
+    if n is not None:
+        return n
     try:
         val = _arith(v)
         if isinstance(val, (int, float)):
@@ -579,18 +678,26 @@ class MacroPreprocessor:
             cond = header[len("%while"):].strip().strip("(").rstrip(")")
             guard = 0
             parts = []
-            while self._cond(cond, scope) and guard < 2000:
+            while guard < _MAX_WHILE_ITERS and self._cond(cond, scope):
+                before = self._resolve(cond, scope)
                 parts.append(self._expand(body, scope, depth + 1))
                 guard += 1
+                # Stop when the loop body cannot move the condition (common in
+                # synthetic date batches that omit the iterator %let).
+                if self._resolve(cond, scope) == before:
+                    break
             return "".join(parts), end_idx
         if up.startswith("%UNTIL"):
             cond = header[len("%until"):].strip().strip("(").rstrip(")")
             guard = 0
             parts = []
-            while guard < 2000:
+            while guard < _MAX_WHILE_ITERS:
+                before = self._resolve(cond, scope)
                 parts.append(self._expand(body, scope, depth + 1))
                 guard += 1
                 if self._cond(cond, scope):
+                    break
+                if self._resolve(cond, scope) == before:
                     break
             return "".join(parts), end_idx
         # %do %over (word list);  /  %do name %over word-list;
@@ -792,11 +899,19 @@ class MacroPreprocessor:
 
     def _sysfunc(self, arg_text: str, scope, depth) -> str:
         text = arg_text.strip()
-        m = re.match(r"^([A-Za-z_]\w*)\s*\((.*)\)$", text, flags=re.S)
+        m = re.match(r"^([A-Za-z_]\w*)\s*\(", text)
         if not m:
             return self._resolve(arg_text, scope)
         fn = m.group(1).lower()
-        args = [self._resolve(a, scope).strip() for a in _split_commas(m.group(2))]
+        inner, after = _balanced(text, m.end() - 1)
+        rest = text[after:].strip()
+        fmt = None
+        if rest.startswith(","):
+            fmt = rest[1:].strip().rstrip(".")
+        elif rest:
+            # Unrecognized trailing junk — fall back to resolve.
+            return self._resolve(arg_text, scope)
+        args = [self._resolve(a, scope).strip() for a in _split_commas(inner)]
         if fn == "countw":
             v = args[0] if args else ""
             delims = args[1] if len(args) > 1 and args[1] else " "
@@ -812,6 +927,46 @@ class MacroPreprocessor:
             return args[0][::-1] if args else ""
         if fn == "compress":
             return "".join(args[0].split()) if args else ""
+        if fn == "mdy" and len(args) >= 3:
+            try:
+                month, day, year = int(float(args[0])), int(float(args[1])), int(float(args[2]))
+                return _format_sas_date(_to_sas_date(date(year, month, day)), fmt)
+            except Exception:
+                return ""
+        if fn in ("date", "today"):
+            return _format_sas_date(_to_sas_date(date.today()), fmt)
+        if fn == "intnx" and len(args) >= 3:
+            start = _numeric(args[1])
+            incr = _numeric(args[2])
+            align = args[3] if len(args) > 3 else "same"
+            if start is None or incr is None:
+                return ""
+            val = _intnx(args[0], start, incr, align)
+            return _format_sas_date(val, fmt) if val is not None else ""
+        if fn == "intck" and len(args) >= 3:
+            a, b = _numeric(args[1]), _numeric(args[2])
+            if a is None or b is None:
+                return ""
+            unit = args[0].strip().lower().strip("'\"")
+            da, db = _from_sas_date(a), _from_sas_date(b)
+            if unit in ("month", "months"):
+                return str((db.year - da.year) * 12 + (db.month - da.month))
+            if unit in ("year", "years"):
+                return str(db.year - da.year)
+            if unit in ("day", "days"):
+                return str((db - da).days)
+            return ""
+        if fn in ("day", "month", "year") and args:
+            n = _numeric(args[0])
+            if n is None:
+                return ""
+            d = _from_sas_date(n)
+            return str(getattr(d, fn))
+        if fn in ("put", "putn") and args:
+            n = _numeric(args[0])
+            if n is not None and (fmt or (len(args) > 1)):
+                return _format_sas_date(n, fmt or args[1])
+            return args[0]
         nums = [_numeric(a) for a in args]
         if fn == "sum":
             vals = [v for v in nums if v is not None]
