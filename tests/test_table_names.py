@@ -126,6 +126,11 @@ class TestDataStepTableNames(unittest.TestCase):
         prog = self.parser.parse("data t; set src end=eof nobs=n; x = 1; run;")
         self.assertEqual(prog.data_steps[0].input_tables, ["src"])
 
+    def test_parenthesis_inside_a_literal_does_not_swallow_the_next_dataset(self):
+        # Counting the ( in "(" would unbalance the option group and eat b.
+        prog = self.parser.parse('data t; set a(where=(x="(")) b; v = 1; run;')
+        self.assertEqual(prog.data_steps[0].input_tables, ["a", "b"])
+
     def test_merge_reads_every_dataset(self):
         prog = self.parser.parse(
             "data m; merge a.one (in=i1) a.two (in=i2); by k; x = 1; run;")

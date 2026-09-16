@@ -21,6 +21,7 @@ import random
 from collections import deque
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ..tables import build_inventory, diagnose
 from .payload import ProgramIndex, _walk_chain
 
 SYSTEM_PROMPT = (
@@ -35,6 +36,32 @@ SYSTEM_PROMPT = (
     "'Terminal fields: LIST.'; or 'No downstream use: FIELD is terminal.'\n"
     "- Affectedness: start with YES or NO. YES adds 'via: A -> B -> ...' with "
     "the dependency path. NO ends with 'is not built from OTHER.'"
+)
+
+# The field explainer's prompt is trained against field packets; the
+# diagnostics question is a different job with a different fact shape, so it
+# gets its own prompt rather than diluting that one.
+DIAGNOSTICS_SYSTEM_PROMPT = (
+    "You are the SAS Field Lineage auditor. Use ONLY the FACTS given by the "
+    "user; never invent tables, libraries, macro variables or counts. Report "
+    "on persistent tables — those written or read through a library other than "
+    "WORK, which outlive the SAS session. Answer in plain English, short "
+    "lines, in this order:\n"
+    "1. One line with the totals: how many tables, how many persistent, which "
+    "libraries.\n"
+    "2. 'Unresolved persistent tables:' then one line per table "
+    "'- TABLE (written by ... / read by ...) — unresolved: NAMES'. Write "
+    "'Unresolved persistent tables: none.' when there are none.\n"
+    "3. 'Cannot classify:' the same shape, for names whose library itself is "
+    "unresolved. Omit the section when empty.\n"
+    "4. One closing line naming the cause of each unresolved name: set at run "
+    "time by call symput, a SAS automatic variable, a macro not found in the "
+    "source, or a dependency cycle. Omit causes that do not apply."
+)
+
+DIAGNOSTICS_QUESTION = (
+    "Summarise the persistent-table errors in this program: which persistent "
+    "tables could not be resolved to a literal name, and why."
 )
 
 MAX_FLOWS = 10
@@ -238,6 +265,90 @@ class FieldFacts:
         path = self.upstream_path(pack["field"], pack["other"])
         return (ents | set(path) if path else ents), ("YES" if path else "NO")
 
+    # ---- program-level diagnostics --------------------------------------- #
+    def diagnostics_packet(self) -> Dict[str, Any]:
+        """Facts about the program's persistent tables and unresolved names."""
+        report = diagnose(self.program)
+        inventory = build_inventory(self.program)
+        report["kind"] = "diagnostics"
+        report["persistent_tables"] = [
+            {"table": i.name, "libref": i.libref, "stage": i.stage,
+             "written_by": list(i.written_by), "read_by": list(i.read_by)}
+            for i in inventory.values() if i.persistent and not i.unresolved
+        ]
+        return report
+
+    def render_diagnostics(self, pack: Dict[str, Any]) -> str:
+        """Canonical plain-English rendering of the diagnostics packet."""
+        counts = pack.get("counts", {})
+        libs = pack.get("libraries") or []
+        lines = [
+            f"{counts.get('tables', 0)} tables: "
+            f"{counts.get('persistent', 0)} persistent, "
+            f"{counts.get('transient', 0)} in WORK"
+            + (f"; libraries: {', '.join(libs)}." if libs else ".")
+        ]
+
+        def block(title: str, rows: List[Dict[str, Any]]) -> None:
+            if not rows:
+                return
+            lines.append(f"{title}:")
+            for row in rows:
+                where = []
+                if row.get("written_by"):
+                    where.append("written by " + ", ".join(row["written_by"]))
+                if row.get("read_by"):
+                    where.append("read by " + ", ".join(row["read_by"]))
+                causes = row.get("causes") or {}
+                refs = ", ".join(
+                    f"{ref} ({causes[ref]})" if ref in causes else ref
+                    for ref in (row.get("macro_refs") or [])
+                ) or "unknown"
+                lines.append(
+                    f"- {row['table']}"
+                    + (f" ({'; '.join(where)})" if where else "")
+                    + f" - unresolved: {refs}"
+                )
+
+        errors = pack.get("errors") or []
+        if errors:
+            block("Unresolved persistent tables", errors)
+        else:
+            lines.append("Unresolved persistent tables: none.")
+        block("Cannot classify (the library itself is unresolved)", pack.get("unknown") or [])
+
+        notes = []
+        if pack.get("unresolved_macros"):
+            notes.append("macros not found in the source: "
+                         + ", ".join(pack["unresolved_macros"]))
+        if pack.get("macro_cycles"):
+            notes.append("recursive macros: " + ", ".join(pack["macro_cycles"]))
+        if not pack.get("macro_expansion_ran"):
+            notes.append("macro expansion was not run for this parse")
+        if notes:
+            lines.append("Also: " + "; ".join(notes) + ".")
+        return "\n".join(lines)
+
+    def diagnostics_universe(self, pack: Dict[str, Any]) -> Set[str]:
+        """Every name the model may cite in a diagnostics answer."""
+        u: Set[str] = set()
+        for row in (pack.get("errors") or []) + (pack.get("unknown") or []):
+            u.add(row["table"])
+            u.update(row.get("macro_refs") or [])
+            u.update((row.get("causes") or {}).keys())
+            if row.get("libref"):
+                u.add(row["libref"])
+        for row in pack.get("persistent_tables") or []:
+            u.add(row["table"])
+            if row.get("libref"):
+                u.add(row["libref"])
+        u.update(pack.get("libraries") or [])
+        for key in ("unresolved_symbols", "unresolved_macros",
+                    "automatic_symbols", "runtime_symbols",
+                    "symbol_cycles", "macro_cycles"):
+            u.update(pack.get(key) or [])
+        return {x.lower() for x in u if x}
+
     def packet_universe(self, pack: Dict[str, Any]) -> Set[str]:
         """Every field id visible in a packet (for leak checking)."""
         u: Set[str] = {pack["field"]}
@@ -251,6 +362,10 @@ class FieldFacts:
             u.add(f["to"])
         u.update(pack.get("all_downstream", []))
         u.update(pack.get("terminal_fields", []))
+        # The table that owns a cited field is implied by that field, so naming
+        # it is not a leak. Without this, any two-level table name in an answer
+        # fails the check and the model's answer is thrown away.
+        u.update({fid.rsplit(".", 1)[0] for fid in list(u) if "." in fid})
         return u
 
 

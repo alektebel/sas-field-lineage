@@ -8,6 +8,9 @@ GET  /             -> explorer.html (the web app)
 GET  /api/demo     -> payload for the bundled demo SAS program
 POST /api/parse    -> {"code": "...", "expand_macros": false} -> payload for that SAS program
 POST /api/run      -> {"field": "table.name", "vals": {...}} -> per-hop value rows
+GET|POST /api/diagnostics
+                   -> persistent-table error summary for the loaded program
+                      {answer, source, question, packet, deterministic}
 POST /api/explain  -> {"field": "table.name", "kind": "construction|downstream|affected",
                        "other": "table.name"} -> {answer, source, question, packet}
                        (source: "model" if the SLM service answered within the fact
@@ -36,7 +39,10 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from ..parser import SASParser
-from .facts import FieldFacts, SYSTEM_PROMPT, make_question, user_message
+from .facts import (
+    DIAGNOSTICS_QUESTION, DIAGNOSTICS_SYSTEM_PROMPT, FieldFacts, SYSTEM_PROMPT,
+    make_question, user_message,
+)
 from .payload import build_payload, ProgramIndex
 from .trace import run_field_trace
 
@@ -74,7 +80,11 @@ _index: ProgramIndex | None = None
 _facts: Optional[FieldFacts] = None
 _rng = random.Random(17)
 SLM_URL = os.environ.get("SLM_URL", "http://127.0.0.1:8020")
-_FIELD_TOKEN_RE = re.compile(r"[A-Za-z_]\w*\.[A-Za-z_]\w*")
+# A dotted name in a model answer. It must match the *whole* chain: with
+# two-level table names a field id is ``libref.member.field``, and a two-part
+# pattern would capture only ``libref.member`` -- a token that is not in the
+# universe, so every answer would be rejected and the SLM silently disabled.
+_FIELD_TOKEN_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
 
 
 def _demo_code() -> str:
@@ -130,6 +140,24 @@ def _explain(field_id: str, kind: str, other: str = "") -> Dict[str, Any]:
             answer, source = model_text, "model"
     return {"answer": answer, "source": source, "question": question, "packet": pack,
             "deterministic": deterministic}
+
+
+def _diagnostics() -> Dict[str, Any]:
+    """Summarise the program's persistent-table errors, via the SLM when it is up."""
+    if _facts is None:
+        return {"error": "No program loaded. Call /api/parse first."}
+    pack = _facts.diagnostics_packet()
+    deterministic = _facts.render_diagnostics(pack)
+    universe = _facts.diagnostics_universe(pack)
+    model_text = _slm_explain(DIAGNOSTICS_SYSTEM_PROMPT,
+                              user_message(pack, DIAGNOSTICS_QUESTION))
+    answer, source = deterministic, "deterministic"
+    if model_text:
+        cited = {t.lower() for t in _FIELD_TOKEN_RE.findall(model_text)}
+        if cited <= universe:
+            answer, source = model_text, "model"
+    return {"answer": answer, "source": source, "question": DIAGNOSTICS_QUESTION,
+            "packet": pack, "deterministic": deterministic}
 
 
 def _run_field(field_id: str, vals: Dict[str, Any]) -> Dict[str, Any]:
@@ -197,6 +225,8 @@ class _Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/demo":
             payload = _parse(_demo_code())
             self._send_json(200, payload)
+        elif parsed.path == "/api/diagnostics":
+            self._send_json(200, _diagnostics())
         elif parsed.path.startswith("/api/"):
             self._send_json(404, {"error": "Unknown API endpoint"})
         else:
@@ -218,6 +248,8 @@ class _Handler(BaseHTTPRequestHandler):
             field = body.get("field", "")
             vals = body.get("vals", {})
             self._send_json(200, _run_field(field, vals))
+        elif parsed.path == "/api/diagnostics":
+            self._send_json(200, _diagnostics())
         elif parsed.path == "/api/explain":
             body = self._read_body()
             field = body.get("field", "")

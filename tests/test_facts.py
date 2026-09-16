@@ -70,5 +70,44 @@ class TestFieldFacts(unittest.TestCase):
         self.assertIn('"flows"', msg)
 
 
+
+class TestModelAnswerGuard(unittest.TestCase):
+    """The leak check must not reject an answer for naming a real table."""
+
+    def test_token_regex_matches_a_three_part_field_id(self):
+        from src.sas_lineage.ui.server import _FIELD_TOKEN_RE
+        # With two-level table names a field id is libref.member.field. A
+        # two-part pattern captures only libref.member, which is not in the
+        # universe, so every model answer would be discarded.
+        found = _FIELD_TOKEN_RE.findall("1. bsgl.c20.revenue = qty * price")
+        self.assertIn("bsgl.c20.revenue", found)
+
+    def test_universe_includes_the_table_owning_a_cited_field(self):
+        from src.sas_lineage.parser import SASParser
+        from src.sas_lineage.ui.facts import FieldFacts
+        prog = SASParser().parse(
+            "data bsgl.c19; set raw.feed; qty = units; run;\n"
+            "data bsgl.c20; set bsgl.c19; revenue = qty; run;")
+        facts = FieldFacts(prog)
+        pack = facts.packet("construction", "bsgl.c20.revenue")
+        universe = facts.packet_universe(pack)
+        self.assertIn("bsgl.c20.revenue", universe)
+        self.assertIn("bsgl.c20", universe)
+
+    def test_a_faithful_answer_passes_the_guard(self):
+        from src.sas_lineage.parser import SASParser
+        from src.sas_lineage.ui.facts import FieldFacts
+        from src.sas_lineage.ui.server import _FIELD_TOKEN_RE
+        prog = SASParser().parse(
+            "data bsgl.c19; set raw.feed; qty = units; run;\n"
+            "data bsgl.c20; set bsgl.c19; revenue = qty; run;")
+        facts = FieldFacts(prog)
+        pack = facts.packet("construction", "bsgl.c20.revenue")
+        universe = {u.lower() for u in facts.packet_universe(pack)}
+        cited = {t.lower() for t in _FIELD_TOKEN_RE.findall(facts.render_answer(pack))}
+        self.assertTrue(cited)
+        self.assertTrue(cited <= universe, f"rejected: {sorted(cited - universe)}")
+
+
 if __name__ == "__main__":
     unittest.main()

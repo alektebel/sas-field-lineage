@@ -87,6 +87,30 @@ _MACROREF_RE = re.compile(r"%([A-Za-z_]\w*)")
 # Macro statements that declare or delete symbols: consumed up to the ``;``.
 _DECL_STATEMENTS = {"global", "symdel", "syslput", "sysrput", "abort", "return", "goto"}
 
+# SAS automatic macro variables. They are always "undefined" here because their
+# value comes from the session, not the source, so they are reported apart from
+# names that are genuinely missing -- otherwise a typo hides among them.
+_AUTOMATIC_SYMBOLS = {
+    "sysdate", "sysdate9", "systime", "sysday", "sysscp", "sysscpl", "sysuserid",
+    "syslast", "sysrc", "syserr", "syserrortext", "syswarningtext", "sysver",
+    "sysvlong", "sysvlong4", "sysjobid", "sysindex", "sysparm", "sysnobs",
+    "sysfilrc", "syslibrc", "sysmacroname", "sysprocessname", "sysprocname",
+    "sysstartdate", "sysstarttime", "sysenv", "syssite", "systcpiphostname",
+    "sysdevic", "sysdsn", "syscc", "sysinfo", "sysncpu", "syshostname",
+}
+
+# ``call symput('name', 'literal')`` -- the one runtime assignment whose value
+# is knowable without running the step.
+_SYMPUT_LITERAL_RE = re.compile(
+    r"""\bcall\s+symputx?\s*\(\s*(['"])(?P<name>[^'"]+)\1\s*,\s*(['"])(?P<value>[^'"]*)\3\s*\)""",
+    re.IGNORECASE,
+)
+# Any ``call symput`` with a literal name, whatever the value expression is.
+_SYMPUT_NAME_RE = re.compile(
+    r"""\bcall\s+symputx?\s*\(\s*(['"])(?P<name>[^'"]+)\1\s*,""",
+    re.IGNORECASE,
+)
+
 
 def _symbol_refs(text: str) -> List[str]:
     """Macro-variable names referenced as ``&name`` inside ``text``."""
@@ -341,6 +365,8 @@ class MacroPreprocessor:
         self.macro_cycles: List[str] = []
         self.unresolved: Set[str] = set()
         self.unresolved_macros: Set[str] = set()
+        self.automatic: Set[str] = set()
+        self.runtime_symbols: Set[str] = set()
 
     # ------------------------------------------------------------------ #
     def preprocess(self, code: str, include_base: Optional[str] = None) -> str:
@@ -348,7 +374,7 @@ class MacroPreprocessor:
         code = _strip_macro_comments(code)
         lets = self._scan_definitions(code)
         self._order_macros()
-        self._resolve_lets_topologically(lets)
+        self._resolve_lets_topologically(lets + self._scan_symput(code))
         return self._expand(code, self.symbols, depth=0)
 
     def report(self) -> Dict[str, Any]:
@@ -360,6 +386,8 @@ class MacroPreprocessor:
             "macro_cycles": list(self.macro_cycles),
             "unresolved_symbols": sorted(self.unresolved),
             "unresolved_macros": sorted(self.unresolved_macros),
+            "automatic_symbols": sorted(self.automatic),
+            "runtime_symbols": sorted(self.runtime_symbols),
         }
 
     # ---- phase 1: collect definitions, then order them ------------------ #
@@ -404,6 +432,24 @@ class MacroPreprocessor:
             i = j
         return lets
 
+    def _scan_symput(self, text: str) -> List[Tuple[str, str]]:
+        """Collect ``call symput('name', 'literal')`` assignments.
+
+        SAS only creates these when the DATA step runs, and this pass does not
+        run DATA steps -- so without this the symbol is simply never defined
+        and every table name built from it stays unresolved. Harvesting is
+        limited to a **literal** value, the only case where the result does not
+        depend on the data. A non-literal value is recorded in
+        ``runtime_symbols`` so the gap is named rather than guessed at.
+        """
+        literal = {m.group("name").lower() for m in _SYMPUT_LITERAL_RE.finditer(text)}
+        for m in _SYMPUT_NAME_RE.finditer(text):
+            name = m.group("name").lower()
+            if name not in literal:
+                self.runtime_symbols.add(name)
+        return [(m.group("name").lower(), m.group("value"))
+                for m in _SYMPUT_LITERAL_RE.finditer(text)]
+
     def _register_macro(self, block: str) -> None:
         """Store one ``%macro ... %mend`` block, plus any macro nested in it."""
         head = re.match(r"%\s*macro\s*", block, re.IGNORECASE)
@@ -441,6 +487,9 @@ class MacroPreprocessor:
 
     def _resolve_lets_topologically(self, lets: List[Tuple[str, str]]) -> None:
         """Pre-evaluate the single-assignment ``%let``s in dependency order.
+
+        The input is the top-level ``%let``s plus the literal
+        ``call symput`` assignments, which are definitions of the same kind.
 
         A macro variable assigned more than once is sequential state, and a
         topological order would silently pick the wrong assignment, so those
@@ -508,7 +557,8 @@ class MacroPreprocessor:
                 j += 1  # the name-delimiter dot is consumed, not emitted
             val = self._symval(name, scope)
             if val is None:
-                self.unresolved.add(name.lower())
+                key = name.lower()
+                (self.automatic if key in _AUTOMATIC_SYMBOLS else self.unresolved).add(key)
                 out.append(text[i:j])   # leave the reference literal, SAS-style
             else:
                 out.append(val)

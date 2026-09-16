@@ -63,6 +63,18 @@ def main():
     )
 
     parser.add_argument(
+        '--excel',
+        type=str,
+        help='Write the lineage to an .xlsx workbook: one sheet, one row per field'
+    )
+
+    parser.add_argument(
+        '--diagnose',
+        action='store_true',
+        help='Print the persistent-table check: which non-WORK tables could not be resolved, and why'
+    )
+
+    parser.add_argument(
         '--macro-report',
         action='store_true',
         help='Print the macro expansion report: topological order used, dependency cycles, and names left unresolved'
@@ -96,6 +108,8 @@ def main():
     print(f"Found {len(program.get_all_fields())} fields in {len(program.data_steps)} data steps")
     if args.macro_report:
         print_macro_report(program, expand)
+    if args.diagnose:
+        print_diagnostics(program)
     print()
     
     # Execute requested operation
@@ -111,6 +125,12 @@ def main():
         result = tracker.browse_fields(args.table)
         print_browse_result(result)
     
+    elif args.excel:
+        from .excel import write_workbook
+        out_path = write_workbook(program, args.excel)
+        print(f"Lineage exported to {out_path}")
+        result = {"excel_file": str(out_path)}
+
     elif args.graph:
         # Export graph
         dot_graph = tracker.export_graph_dot()
@@ -131,6 +151,16 @@ def main():
         print(f"\nResults saved to {args.output}")
     
     return 0
+
+
+def print_diagnostics(program):
+    """Print the persistent-table check for a parsed program."""
+    from .ui.facts import FieldFacts
+    facts = FieldFacts(program)
+    print()
+    print("Persistent table check")
+    for line in facts.render_diagnostics(facts.diagnostics_packet()).splitlines():
+        print(f"  {line}")
 
 
 def print_macro_report(program, expanded):

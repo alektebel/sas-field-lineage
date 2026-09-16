@@ -66,16 +66,7 @@ def _split_dataset_refs(text: str) -> List[str]:
         if ch == "/":                      # step options: nothing after is a dataset
             break
         if ch == "(":                      # dataset options of the previous name
-            depth = 0
-            while i < n:
-                if text[i] == "(":
-                    depth += 1
-                elif text[i] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        i += 1
-                        break
-                i += 1
+            i = _skip_parens(text, i)
             continue
         m = re.match(_DS_TOKEN, text[i:])
         if not m:
@@ -93,6 +84,34 @@ def _split_dataset_refs(text: str) -> List[str]:
             refs.append(name)
         i = j
     return refs
+
+
+def _skip_parens(text: str, start: int) -> int:
+    """Index just past the parenthesis group opening at ``start``.
+
+    Quoted literals are skipped whole: a parenthesis inside ``where=(x="(")``
+    is data, and counting it would unbalance the group and swallow whatever
+    dataset came next.
+    """
+    depth = 0
+    i, n = start, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "\"'":
+            quote = ch
+            i += 1
+            while i < n and text[i] != quote:
+                i += 1
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
 
 
 def _sql_sources(stmt: str) -> List[str]:

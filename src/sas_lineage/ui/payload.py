@@ -17,6 +17,7 @@ import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..ast.field_ast import FieldNode, SASProgram
+from ..tables import stage_of, table_graph
 
 # Palette copied verbatim from the mockup so the backend never has to guess.
 COLORS = {
@@ -111,49 +112,13 @@ class ProgramIndex:
 # Data-flow graph (nodes + edges + layers)
 # --------------------------------------------------------------------------- #
 def _all_tables(program: SASProgram) -> Tuple[Set[str], List[Tuple[str, str]]]:
-    tables: Set[str] = set()
-    edges: List[Tuple[str, str]] = []
-    for ds in program.data_steps:
-        outs = ds.output_tables or ([ds.output_table] if ds.output_table else [])
-        tables.update(outs)
-        for inp in ds.input_tables:
-            tables.add(inp)
-            for out in outs:
-                edges.append((inp, out))
-    for ps in program.proc_steps:
-        tables.update(ps.input_tables)
-        tables.update(ps.output_tables)
-        for out in ps.output_tables:
-            for inp in ps.input_tables:
-                if inp != out:
-                    edges.append((inp, out))
-    return tables, edges
+    """Tables and data-flow edges. Shared with the table inventory."""
+    return table_graph(program)
 
 
 def _layer_cols(edges: List[Tuple[str, str]]) -> Dict[str, int]:
     """Assign each table a layer column (longest path from a source)."""
-    producers: Dict[str, Set[str]] = {}
-    for src, dst in edges:
-        producers.setdefault(dst, set()).add(src)
-    nodes = {n for e in edges for n in e}
-    col: Dict[str, int] = {}
-
-    def longest(n: str, seen: Set[str]) -> int:
-        if n in col:
-            return col[n]
-        if n in seen:
-            return 0
-        seen = seen | {n}
-        ins = producers.get(n, set())
-        best = 0
-        for p in ins:
-            best = max(best, 1 + longest(p, seen))
-        col[n] = best
-        return best
-
-    for n in nodes:
-        longest(n, set())
-    return col
+    return stage_of(edges)
 
 
 def _node_field_counts(program: SASProgram) -> Dict[str, int]:
