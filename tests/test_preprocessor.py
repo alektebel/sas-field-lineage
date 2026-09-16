@@ -13,10 +13,12 @@ class TestMacroPreprocessor(unittest.TestCase):
         self.parser = SASParser()
 
     def test_let_and_symbol_resolution(self):
+        # &lib..raw is the two-level name stg.raw: the trailing dot delimits
+        # the symbol, the second one is the libref separator.
         code = "%let lib = stg;\ndata &lib..raw;\n  set &lib..src;\n  y = 100;\nrun;\n"
         prog = self.parser.parse(code, expand_macros=True)
-        self.assertEqual(prog.data_steps[0].output_table, "stg")
-        self.assertIn("stg", prog.data_steps[0].input_tables)
+        self.assertEqual(prog.data_steps[0].output_table, "stg.raw")
+        self.assertIn("stg.src", prog.data_steps[0].input_tables)
 
     def test_macro_loop_generates_data_steps(self):
         code = """

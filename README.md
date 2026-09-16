@@ -111,6 +111,9 @@ sas-lineage examples/sales_analysis.sas --expand-macros
 
 # Expand macros and resolve %include only below a sandbox directory
 sas-lineage examples/sales_analysis.sas --include-base examples/includes
+
+# Show how the macro pass resolved names (order, cycles, what stayed unresolved)
+sas-lineage examples/sales_analysis.sas --expand-macros --macro-report
 ```
 
 ## How It Works
@@ -120,21 +123,64 @@ sas-lineage examples/sales_analysis.sas --include-base examples/includes
 The SAS parser reads your SAS code and identifies:
 - DATA steps with input/output tables
 - Field assignments and calculations
-- SET, MERGE, and BY statements
+- SET, MERGE, UPDATE, MODIFY and BY statements
+- PROC `DATA=` / `OUT=` / `BASE=` options and `PROC SQL` targets and sources
 - Field dependencies and transformations
 
 It is statement-based (semicolon-delimited), so it handles compact
 single-line steps (`data x; set y; run;`), `QUIT;`-terminated PROC steps and
 inline `datalines`/`cards` blocks across a whole file, not just one step.
 
+#### Table names
+
+A table name is read as the whole literal, not as its first word:
+
+- two-level names keep their libref — `data stg.raw;` is the table `stg.raw`,
+  not `stg`;
+- `WORK.` is folded (`work.sales` and `sales` are one dataset, so they are one
+  node) and names are case-folded, since SAS dataset names are
+  case-insensitive;
+- every dataset of a list is read — `data mart.a mart.b;` writes two tables
+  (`output_tables`), `merge a(in=x) b(in=y);` reads two;
+- dataset options (`(keep=…)`, `(where=(…))`, `(in=…)`) and statement options
+  (`end=`, `nobs=`, `/ view=`) are skipped rather than mistaken for datasets;
+- a `PROC SQL` block yields one step per `CREATE TABLE` / `INSERT INTO`, each
+  with only its own `FROM`/`JOIN` sources.
+
+A name that still holds an unexpanded `&` or `%` after macro expansion is kept
+verbatim and listed in `step.metadata["unresolved_tables"]`, so a table the
+tool merely copied through is never mistaken for one it resolved.
+
 #### SAS macros (`expand_macros=True`)
 
 `SASParser.parse(code, expand_macros=True)` first expands the deterministic
-SAS macro subset — `%macro`/`%mend`, `%let`, `%put`, `%if %then %else`,
-`%do %to %by` / `%do %over` / `%do %while` / `%do %until`, `&var` / `&&var`
-(including the `.`-name-delimiter rule), and `%eval`/`%scan`/`%substr`/
-`%sysfunc(countw(...))`/etc. — so steps generated inside macros become plain
-code for lineage.
+SAS macro subset — `%macro`/`%mend`, `%let`, `%put`, `%global`/`%local`,
+`%if %then %else`, `%do %to %by` / `%do %over` / `%do %while` / `%do %until`,
+`&var` / `&&var` (including the `.`-name-delimiter rule), and
+`%eval`/`%scan`/`%substr`/`%sysfunc(countw(...))`/etc. — so steps generated
+inside macros become plain code for lineage.
+
+Expansion runs in two phases so that **where a definition sits in the file
+stops deciding whether it resolves**:
+
+1. A collect pass registers every `%macro` definition (nested ones included)
+   and every top-level `%let`, expanding nothing. The single-assignment
+   `%let`s are then evaluated in **topological order of their dependencies**,
+   so `%let a = &b._x;` written *above* `%let b = core;` yields `core_x` — the
+   literal real SAS produces, because SAS stores the unresolved text and
+   resolves it at use time. A macro invoked above its own `%macro` block
+   resolves for the same reason.
+2. The sequential pass expands the source. It stays sequential on purpose: a
+   macro variable that is **re-assigned** is state, not a definition, and a
+   topological order would silently pick the wrong assignment. Those names are
+   excluded from phase 1 and keep SAS's sequential semantics.
+
+Dependency cycles (`%let p = &q; %let q = &p;`, recursive macros) cannot be
+linearised; they are reported rather than resolved. An unresolved `&name`
+keeps its own text instead of collapsing to an empty string — silently
+inventing `_x` out of `&b._x` is worse than showing the gap. The expander's
+report is available as `preprocess_ex(code)[1]`, on the parsed program as
+`program.macro_report`, and from the CLI via `--macro-report`.
 
 `%include` is only resolved when a sandbox directory is supplied:
 

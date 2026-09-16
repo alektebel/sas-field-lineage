@@ -71,12 +71,26 @@ class FieldNode:
 
 @dataclass
 class DataStepNode:
-    """Represents a SAS DATA step"""
+    """Represents a SAS DATA step
+
+    ``output_table`` is the first dataset the step writes; ``output_tables``
+    holds all of them, because ``DATA a b;`` writes two. Names are the full
+    literal SAS resolves to, ``libref.member`` included. ``metadata`` carries
+    ``unresolved_tables`` when a name still contains an unexpanded ``&`` or
+    ``%``, i.e. when the parser copied the reference through instead of
+    knowing the table.
+    """
     output_table: str
     input_tables: List[str] = field(default_factory=list)
     fields: List[FieldNode] = field(default_factory=list)
     where_clause: Optional[str] = None
     merge_keys: List[str] = field(default_factory=list)
+    output_tables: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not self.output_tables and self.output_table:
+            self.output_tables = [self.output_table]
     
     def add_field(self, field_node: FieldNode):
         """Add a field to this data step"""
@@ -92,12 +106,27 @@ class DataStepNode:
 
 @dataclass
 class ProcStepNode:
-    """Represents a SAS PROC step"""
+    """Represents a SAS PROC step
+
+    ``input_table`` / ``output_table`` stay the primary pair, while
+    ``input_tables`` / ``output_tables`` hold every dataset the step reads or
+    writes -- a ``PROC SQL`` join reads several, and a ``PROC`` step can write
+    several (``OUT=`` plus ``OUTPUT OUT=``).
+    """
     proc_name: str
     input_table: Optional[str] = None
     output_table: Optional[str] = None
     fields: List[FieldNode] = field(default_factory=list)
     options: Dict[str, Any] = field(default_factory=dict)
+    input_tables: List[str] = field(default_factory=list)
+    output_tables: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not self.input_tables and self.input_table:
+            self.input_tables = [self.input_table]
+        if not self.output_tables and self.output_table:
+            self.output_tables = [self.output_table]
 
 
 class SASProgram:
@@ -139,11 +168,9 @@ class SASProgram:
         """Get all table names in the program"""
         tables = set()
         for ds in self.data_steps:
-            tables.add(ds.output_table)
+            tables.update(ds.output_tables or ([ds.output_table] if ds.output_table else []))
             tables.update(ds.input_tables)
         for ps in self.proc_steps:
-            if ps.input_table:
-                tables.add(ps.input_table)
-            if ps.output_table:
-                tables.add(ps.output_table)
+            tables.update(ps.input_tables)
+            tables.update(ps.output_tables)
         return tables

@@ -63,6 +63,12 @@ def main():
     )
 
     parser.add_argument(
+        '--macro-report',
+        action='store_true',
+        help='Print the macro expansion report: topological order used, dependency cycles, and names left unresolved'
+    )
+
+    parser.add_argument(
         '--include-base',
         type=str,
         help='Sandbox directory for %include (requires --expand-macros; reads below this directory only)'
@@ -88,6 +94,8 @@ def main():
     tracker = LineageTracker(program)
     
     print(f"Found {len(program.get_all_fields())} fields in {len(program.data_steps)} data steps")
+    if args.macro_report:
+        print_macro_report(program, expand)
     print()
     
     # Execute requested operation
@@ -123,6 +131,34 @@ def main():
         print(f"\nResults saved to {args.output}")
     
     return 0
+
+
+def print_macro_report(program, expanded):
+    """Print how the macro pass resolved the program's names."""
+    report = getattr(program, "macro_report", {}) or {}
+    if not expanded:
+        print("Macro expansion is off (--expand-macros); table names are read verbatim.")
+        return
+    print()
+    print("Macro expansion report")
+    print(f"  %let resolution order : {' -> '.join(report.get('symbol_order') or []) or '(none)'}")
+    print(f"  macro order (callees first): {' -> '.join(report.get('macro_order') or []) or '(none)'}")
+    for key, label in (("symbol_cycles", "%let dependency cycles"),
+                       ("macro_cycles", "recursive macros"),
+                       ("unresolved_symbols", "unresolved &names"),
+                       ("unresolved_macros", "unresolved %macros")):
+        values = report.get(key) or []
+        if values:
+            print(f"  {label}: {', '.join(values)}")
+    if report.get("fallback"):
+        print(f"  fallback: {report['fallback']}")
+    unresolved = sorted({
+        t
+        for step in list(program.data_steps) + list(program.proc_steps)
+        for t in step.metadata.get("unresolved_tables", [])
+    })
+    if unresolved:
+        print(f"  table names still unresolved: {', '.join(unresolved)}")
 
 
 def print_query_result(result):

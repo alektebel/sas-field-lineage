@@ -8,7 +8,111 @@ from ..ast.field_ast import (
     FieldNode, FieldOperationType, DataStepNode, 
     ProcStepNode, SASProgram
 )
-from .preprocessor import preprocess
+from .preprocessor import preprocess_ex
+
+# A dataset reference: ``[libref.]member`` where either part may still carry an
+# unexpanded ``&``/``%`` reference that the macro pass could not resolve.
+_DS_TOKEN = r"[A-Za-z_&%][\w.&%$]*"
+_DATA_OPT_RE = re.compile(r"\bDATA\s*=\s*(" + _DS_TOKEN + r")", re.IGNORECASE)
+_OUT_OPT_RE = re.compile(r"\bOUT(?:EST)?\s*=\s*(" + _DS_TOKEN + r")", re.IGNORECASE)
+_BASE_OPT_RE = re.compile(r"\bBASE\s*=\s*(" + _DS_TOKEN + r")", re.IGNORECASE)
+_SQL_CREATE_RE = re.compile(r"\bCREATE\s+(?:TABLE|VIEW)\s+(" + _DS_TOKEN + r")", re.IGNORECASE)
+_SQL_INSERT_RE = re.compile(r"\bINSERT\s+INTO\s+(" + _DS_TOKEN + r")", re.IGNORECASE)
+_SQL_JOIN_RE = re.compile(r"\bJOIN\s+(" + _DS_TOKEN + r")", re.IGNORECASE)
+_SQL_FROM_RE = re.compile(
+    r"\bFROM\s+(.*?)(?=\b(?:FROM|WHERE|GROUP|HAVING|ORDER|INNER|LEFT|RIGHT|FULL|OUTER|CROSS|JOIN|ON|UNION|EXCEPT|INTERSECT)\b|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+# DATA-step statements whose operand is a list of datasets to read.
+_INPUT_STATEMENTS = {"SET", "MERGE", "UPDATE", "MODIFY"}
+
+
+def _normalize_table(name: str) -> str:
+    """Canonical form of a dataset reference.
+
+    SAS dataset names are case-insensitive and an explicit ``WORK.`` libref
+    names the same dataset as the bare member, so both are folded -- otherwise
+    ``work.sales`` and ``sales`` become two nodes for one table. A name that
+    still holds an unresolved macro reference is lowercased but otherwise kept
+    verbatim, so the caller can see exactly what was not resolved.
+    """
+    name = name.strip().strip("()").strip().rstrip(".").lower()
+    if name.startswith("work."):
+        name = name[len("work."):]
+    return name
+
+
+def is_unresolved_table(name: str) -> bool:
+    """True when a table name still carries an unexpanded macro reference."""
+    return "&" in name or "%" in name
+
+
+def _split_dataset_refs(text: str) -> List[str]:
+    """Split a SAS dataset list into canonical table names.
+
+    Handles ``libref.member``, dataset options in balanced parentheses
+    (``(keep=a b)``, ``(in=x)``, ``(where=(y>0))``), several datasets on one
+    statement, and the ``/`` that introduces step options. A bare
+    ``keyword=`` token (``END=``, ``NOBS=``, ``POINT=``, ``NODUPKEY``-style
+    options) terminates the list: it is an option, not a dataset.
+    """
+    refs: List[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n,":
+            i += 1
+            continue
+        if ch == "/":                      # step options: nothing after is a dataset
+            break
+        if ch == "(":                      # dataset options of the previous name
+            depth = 0
+            while i < n:
+                if text[i] == "(":
+                    depth += 1
+                elif text[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+            continue
+        m = re.match(_DS_TOKEN, text[i:])
+        if not m:
+            i += 1
+            continue
+        token = m.group(0)
+        j = i + m.end()
+        k = j
+        while k < n and text[k] in " \t\r\n":
+            k += 1
+        if k < n and text[k] == "=":       # an option keyword, not a dataset
+            break
+        name = _normalize_table(token)
+        if name and name not in refs:
+            refs.append(name)
+        i = j
+    return refs
+
+
+def _sql_sources(stmt: str) -> List[str]:
+    """Tables read by one ``PROC SQL`` statement (FROM list plus JOINs)."""
+    out: List[str] = []
+    for m in _SQL_FROM_RE.finditer(stmt):
+        for item in m.group(1).split(","):
+            item = item.strip()
+            if not item or item.startswith("("):   # in-line sub-select
+                continue
+            first = item.split()[0]                # drop ``AS alias`` / ``alias``
+            name = _normalize_table(first)
+            if name and name not in out:
+                out.append(name)
+    for m in _SQL_JOIN_RE.finditer(stmt):
+        name = _normalize_table(m.group(1))
+        if name and name not in out:
+            out.append(name)
+    return out
+
 
 # Common SAS keywords and functions that should not be treated as field references
 SAS_KEYWORDS = {
@@ -45,10 +149,15 @@ class SASParser:
 
         ``%include`` is only resolved when ``include_base`` is a directory.
         Included files are read from that directory (or below) only.
+
+        The expander's diagnostics (topological orders used, dependency cycles
+        it could not linearise, names left unresolved) are attached to the
+        returned program as ``macro_report``.
         """
         program = SASProgram()
+        program.macro_report = {}
         if expand_macros:
-            sas_code = preprocess(sas_code, include_base=include_base)
+            sas_code, program.macro_report = preprocess_ex(sas_code, include_base=include_base)
         stmts = self._tokenize(sas_code)
 
         i = 0
@@ -65,8 +174,8 @@ class SASParser:
                     program.add_data_step(data_step)
                 continue
             if upper.startswith('PROC '):
-                proc_step, i = self._parse_proc_step(stmts, i)
-                if proc_step:
+                proc_steps, i = self._parse_proc_step(stmts, i)
+                for proc_step in proc_steps:
                     program.add_proc_step(proc_step)
                 continue
             i += 1
@@ -127,12 +236,15 @@ class SASParser:
         index just after its terminator (``RUN;``/``QUIT;``).
         """
         text, line = stmts[start_line]
-        match = re.search(r'DATA\s+(\w+)', text, re.IGNORECASE)
-        if not match:
+        # Everything after the DATA keyword is a dataset list: it may name
+        # several outputs, carry a libref and dataset options on each, and end
+        # with ``/`` step options.
+        outputs = _split_dataset_refs(re.sub(r'^\s*DATA\b', '', text, count=1, flags=re.IGNORECASE))
+        if not outputs:
             return None, start_line + 1
 
-        output_table = match.group(1)
-        data_step = DataStepNode(output_table=output_table)
+        output_table = outputs[0]
+        data_step = DataStepNode(output_table=output_table, output_tables=outputs)
 
         i = start_line + 1
         while i < len(stmts):
@@ -147,16 +259,11 @@ class SASParser:
                 i += 1
                 break
 
-            if upper.startswith('SET '):
-                set_match = re.search(r'SET\s+([\w\s]+)', stmt, re.IGNORECASE)
-                if set_match:
-                    data_step.input_tables.extend(
-                        t for t in set_match.group(1).split() if t.strip())
-            elif upper.startswith('MERGE '):
-                merge_match = re.search(r'MERGE\s+([\w\s]+)', stmt, re.IGNORECASE)
-                if merge_match:
-                    data_step.input_tables.extend(
-                        t for t in merge_match.group(1).split() if t.strip())
+            keyword = upper.split(None, 1)[0] if upper.split() else ''
+            if keyword in _INPUT_STATEMENTS:
+                for t in _split_dataset_refs(stmt[len(keyword):]):
+                    if t not in data_step.input_tables:
+                        data_step.input_tables.append(t)
             elif upper.startswith('BY '):
                 by_match = re.search(r'BY\s+([\w\s]+)', stmt, re.IGNORECASE)
                 if by_match:
@@ -179,44 +286,88 @@ class SASParser:
                     data_step.add_field(field_node)
             i += 1
 
+        unresolved = [t for t in data_step.output_tables + data_step.input_tables
+                      if is_unresolved_table(t)]
+        if unresolved:
+            data_step.metadata['unresolved_tables'] = unresolved
+
         return data_step, i
     
-    def _parse_proc_step(self, stmts, start_line: int) -> Tuple[Optional[ProcStepNode], int]:
+    def _parse_proc_step(self, stmts, start_line: int) -> Tuple[List[ProcStepNode], int]:
         """
-        Parse a PROC step (simplified), returning the step and the index just
-        after its terminator (``RUN;`` or ``QUIT;``).
+        Parse a PROC step, returning its step nodes and the index just after
+        its terminator (``RUN;`` or ``QUIT;``).
+
+        A ``PROC SQL`` block yields one node per ``CREATE TABLE`` /
+        ``INSERT INTO`` statement, so each target keeps only its own sources;
+        every other PROC yields a single node.
         """
         text, line = stmts[start_line]
 
         # Extract PROC name
         match = re.search(r'PROC\s+(\w+)', text, re.IGNORECASE)
         if not match:
-            return None, start_line + 1
+            return [], start_line + 1
 
         proc_name = match.group(1).upper()
-        proc_step = ProcStepNode(proc_name=proc_name)
+        inputs: List[str] = []
+        outputs: List[str] = []
+        sql_steps: List[ProcStepNode] = []
 
-        i = start_line + 1
+        # The PROC statement itself carries DATA=/OUT=, so scanning must start
+        # on it and not on the statement after it.
+        i = start_line
         while i < len(stmts):
             stmt, ln = stmts[i]
             upper = stmt.upper()
-            if upper.startswith('RUN') or upper.startswith('QUIT'):
+            if i > start_line and (upper.startswith('RUN') or upper.startswith('QUIT')):
                 i += 1
                 break
 
-            # Extract DATA= option
-            data_match = re.search(r'DATA\s*=\s*(\w+)', stmt, re.IGNORECASE)
-            if data_match:
-                proc_step.input_table = data_match.group(1)
+            for m in _DATA_OPT_RE.finditer(stmt):
+                name = _normalize_table(m.group(1))
+                if name and name not in inputs:
+                    inputs.append(name)
+            for rx in (_OUT_OPT_RE, _BASE_OPT_RE):
+                for m in rx.finditer(stmt):
+                    name = _normalize_table(m.group(1))
+                    if name and name not in outputs:
+                        outputs.append(name)
 
-            # Extract OUT= option
-            out_match = re.search(r'OUT\s*=\s*(\w+)', stmt, re.IGNORECASE)
-            if out_match:
-                proc_step.output_table = out_match.group(1)
+            if proc_name == 'SQL':
+                # Each CREATE TABLE / INSERT INTO is its own derivation: they
+                # must not share one input list, or every source of one
+                # statement would look like a source of the others.
+                targets = [_normalize_table(m.group(1)) for m in _SQL_CREATE_RE.finditer(stmt)]
+                targets += [_normalize_table(m.group(1)) for m in _SQL_INSERT_RE.finditer(stmt)]
+                sources = _sql_sources(stmt)
+                if targets:
+                    sql_steps.append(self._build_proc_step(proc_name, sources, targets))
+                elif sources:
+                    # A bare SELECT reads without writing; keep the reads.
+                    for name in sources:
+                        if name not in inputs:
+                            inputs.append(name)
 
             i += 1
 
-        return proc_step, i
+        steps = sql_steps
+        if inputs or outputs or not steps:
+            steps = [self._build_proc_step(proc_name, inputs, outputs)] + steps
+        return steps, i
+
+    @staticmethod
+    def _build_proc_step(proc_name: str, inputs: List[str], outputs: List[str]) -> ProcStepNode:
+        """Assemble one PROC step node from its resolved table names."""
+        proc_step = ProcStepNode(proc_name=proc_name)
+        proc_step.input_tables = list(inputs)
+        proc_step.output_tables = list(outputs)
+        proc_step.input_table = inputs[0] if inputs else None
+        proc_step.output_table = outputs[0] if outputs else None
+        unresolved = [t for t in outputs + inputs if is_unresolved_table(t)]
+        if unresolved:
+            proc_step.metadata['unresolved_tables'] = unresolved
+        return proc_step
     
     def _extract_field_references(self, expression: str, source_tables: List[str]) -> List[Tuple[str, Optional[str]]]:
         """

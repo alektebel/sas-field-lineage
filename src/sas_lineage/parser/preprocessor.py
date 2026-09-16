@@ -21,6 +21,27 @@ Supported:
   %eval %sysevalf %scan %index %substr %length %trim %left %upcase %downcase
   %cmpres %cats %catx %str %nrstr %bquote %quote %unquote
   %sysfunc(countw/count/length/find/sum/min/max/int/floor/ceil/round/abs/sqrt/...)
+  %global / %local / %symdel                          declarations
+
+Expansion runs in two phases so that *order of appearance in the file* stops
+mattering for anything that can be resolved statically:
+
+  1. A collect pass registers every ``%macro`` definition (including nested
+     ones) and every top-level ``%let``, expanding nothing. Single-assignment
+     ``%let``s are then evaluated in topological order of their dependencies,
+     so ``%let a = &b._x;`` written *above* ``%let b = core;`` still yields
+     ``core_x`` -- the literal real SAS produces, because SAS stores the
+     unresolved text and resolves it at use time.
+  2. The sequential pass expands the source. Because every definition is
+     already registered, a macro invoked above its own ``%macro`` block
+     resolves; because the pass is still sequential, a macro variable that is
+     *re-assigned* keeps SAS's sequential semantics (topological order is
+     unsound for those, so they are deliberately excluded from phase 1).
+
+An unresolved ``&name`` keeps its own source text rather than collapsing to an
+empty string, matching SAS (which warns and leaves the reference literal) and
+keeping the pass non-destructive. Names that could not be resolved are
+reported in ``MacroPreprocessor.unresolved``.
 """
 
 from __future__ import annotations
@@ -30,7 +51,7 @@ import math
 import operator
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 _KEYWORDS = {
     "macro", "mend", "let", "put", "if", "then", "else",
@@ -54,6 +75,62 @@ _ARITH_OPS = {
 
 _MAX_DEPTH = 40
 _MAX_ITERS = 40000
+_MAX_RESCAN = 20
+
+# Scope key holding the names declared %local for the running macro. It is not
+# a legal SAS macro-variable name, so it can never collide with a real symbol.
+_LOCALS_KEY = "%locals"
+
+_SYMREF_RE = re.compile(r"&+([A-Za-z_]\w*)")
+_MACROREF_RE = re.compile(r"%([A-Za-z_]\w*)")
+
+# Macro statements that declare or delete symbols: consumed up to the ``;``.
+_DECL_STATEMENTS = {"global", "symdel", "syslput", "sysrput", "abort", "return", "goto"}
+
+
+def _symbol_refs(text: str) -> List[str]:
+    """Macro-variable names referenced as ``&name`` inside ``text``."""
+    return [m.group(1).lower() for m in _SYMREF_RE.finditer(text)]
+
+
+def _macro_refs(text: str) -> List[str]:
+    """Macro names invoked as ``%name`` inside ``text`` (keywords excluded)."""
+    out = []
+    for m in _MACROREF_RE.finditer(text):
+        name = m.group(1).lower()
+        if name not in _KEYWORDS and name not in _FUNCS and name not in _DECL_STATEMENTS:
+            out.append(name)
+    return out
+
+
+def _toposort(deps: Dict[str, Set[str]]) -> Tuple[List[str], List[str]]:
+    """Kahn topological sort of ``{node: {dependencies}}``.
+
+    Returns ``(order, cyclic)``: dependencies come before their dependants in
+    ``order``, and ``cyclic`` lists the nodes that never became ready, i.e.
+    the ones caught in a dependency cycle. A self-edge counts as a cycle --
+    a macro that calls itself and a ``%let`` that appends to its own value are
+    both things no order can linearise. Ties are broken by insertion order so
+    the result is deterministic for a given source file."""
+    nodes = list(deps)
+    pending = {n: {d for d in deps[n] if d in deps} for n in nodes}
+    dependants: Dict[str, List[str]] = {n: [] for n in nodes}
+    for n in nodes:
+        for d in pending[n]:
+            dependants[d].append(n)
+    ready = [n for n in nodes if not pending[n]]
+    order: List[str] = []
+    placed = set(ready)
+    while ready:
+        n = ready.pop(0)
+        order.append(n)
+        for m in dependants[n]:
+            pending[m].discard(n)
+            if not pending[m] and m not in placed:
+                placed.add(m)
+                ready.append(m)
+    cyclic = [n for n in nodes if n not in placed]
+    return order, cyclic
 
 
 def _strip_macro_comments(text: str) -> str:
@@ -257,64 +334,196 @@ class MacroPreprocessor:
         self.symbols: Dict[str, str] = {}
         self.include_base = include_base
         self._include_seen: set = set()
+        # Diagnostics filled in by the collect / topological phase.
+        self.symbol_order: List[str] = []
+        self.symbol_cycles: List[str] = []
+        self.macro_order: List[str] = []
+        self.macro_cycles: List[str] = []
+        self.unresolved: Set[str] = set()
+        self.unresolved_macros: Set[str] = set()
 
     # ------------------------------------------------------------------ #
     def preprocess(self, code: str, include_base: Optional[str] = None) -> str:
         self.include_base = include_base or self.include_base
         code = _strip_macro_comments(code)
+        lets = self._scan_definitions(code)
+        self._order_macros()
+        self._resolve_lets_topologically(lets)
         return self._expand(code, self.symbols, depth=0)
 
+    def report(self) -> Dict[str, Any]:
+        """Diagnostics for the last ``preprocess`` call."""
+        return {
+            "symbol_order": list(self.symbol_order),
+            "symbol_cycles": list(self.symbol_cycles),
+            "macro_order": list(self.macro_order),
+            "macro_cycles": list(self.macro_cycles),
+            "unresolved_symbols": sorted(self.unresolved),
+            "unresolved_macros": sorted(self.unresolved_macros),
+        }
+
+    # ---- phase 1: collect definitions, then order them ------------------ #
+    def _scan_definitions(self, text: str, collect_lets: bool = True) -> List[Tuple[str, str]]:
+        """Register every ``%macro`` definition without expanding anything.
+
+        Returns the ``(name, raw_value)`` of the ``%let`` statements written at
+        the top level of ``text``. Registering definitions up-front is what
+        makes a macro invoked *above* its own ``%macro`` block resolve, instead
+        of expanding to nothing and taking the whole file down the
+        "expansion lost every step" fallback path.
+
+        ``%let``s inside a macro body are not collected: their value depends on
+        the invocation, so only the sequential pass can evaluate them."""
+        lets: List[Tuple[str, str]] = []
+        i, n = 0, len(text)
+        while i < n:
+            if text[i] != "%":
+                i += 1
+                continue
+            m = re.match(r"%\s*([A-Za-z_]\w*)", text[i:])
+            if not m:
+                i += 1
+                continue
+            kw = m.group(1).lower()
+            j = i + m.end()
+            if kw == "macro":
+                end = _matching_mend(text, i)
+                self._register_macro(text[i:end])
+                i = end if end > i else i + m.end()
+                continue
+            if kw == "let":
+                sem = text.find(";", j)
+                if sem == -1:
+                    break
+                name, eq, value = text[j:sem].partition("=")
+                name = name.strip().lower()
+                if collect_lets and eq and re.fullmatch(r"[A-Za-z_]\w*", name):
+                    lets.append((name, value.strip()))
+                i = sem + 1
+                continue
+            i = j
+        return lets
+
+    def _register_macro(self, block: str) -> None:
+        """Store one ``%macro ... %mend`` block, plus any macro nested in it."""
+        head = re.match(r"%\s*macro\s*", block, re.IGNORECASE)
+        if not head:
+            return
+        spec_end = block.find(";")
+        if spec_end == -1:
+            return
+        spec = block[head.end():spec_end].strip()
+        hm = re.match(r"([A-Za-z_]\w*)\s*(?:\((.*)\))?$", spec, flags=re.S)
+        if not hm:
+            return
+        body = block[spec_end + 1:]
+        mend_at = body.lower().rfind("%mend")
+        if mend_at != -1:
+            body = body[:mend_at]
+        self.macros[hm.group(1).lower()] = {
+            "params": _parse_params(hm.group(2) or ""),
+            "body": body,
+        }
+        self._scan_definitions(body, collect_lets=False)
+
+    def _order_macros(self) -> None:
+        """Topologically order the registered macros: callees before callers.
+
+        Expansion itself is lazy, so this order is not what drives it; what it
+        buys is a name for the macros the order *cannot* linearise, i.e. the
+        recursive ones, which are exactly the ones ``_MAX_DEPTH`` can truncate
+        silently."""
+        deps = {
+            name: {c for c in _macro_refs(spec["body"]) if c in self.macros}
+            for name, spec in self.macros.items()
+        }
+        self.macro_order, self.macro_cycles = _toposort(deps)
+
+    def _resolve_lets_topologically(self, lets: List[Tuple[str, str]]) -> None:
+        """Pre-evaluate the single-assignment ``%let``s in dependency order.
+
+        A macro variable assigned more than once is sequential state, and a
+        topological order would silently pick the wrong assignment, so those
+        are left entirely to the sequential pass. A name assigned exactly once
+        is a definition: evaluating it after its dependencies reproduces what
+        SAS gets by storing the unresolved text and resolving it at use time.
+
+        The sequential pass re-executes the same ``%let``s afterwards; by then
+        every dependency is bound, so it recomputes the same value. Pre-
+        evaluation only changes what happens *before* the source-order
+        assignment is reached."""
+        counts: Dict[str, int] = {}
+        for name, _ in lets:
+            counts[name] = counts.get(name, 0) + 1
+        single = {name: value for name, value in lets if counts[name] == 1}
+        deps = {
+            name: {d for d in _symbol_refs(value) if d in single}
+            for name, value in single.items()
+        }
+        self.symbol_order, self.symbol_cycles = _toposort(deps)
+        for name in self.symbol_order:
+            self.symbols[name] = self._expand(single[name], self.symbols, depth=1)
+
     # ---- symbol resolution ------------------------------------------- #
-    def _read_symref(self, text: str, amp_idx: int, scope: Dict[str, str]):
-        """Read a symbol ref at ``&``.
+    def _symval(self, name: str, scope: Dict[str, str]) -> Optional[str]:
+        """Value bound to ``name``, or ``None`` when the symbol is unknown.
 
-        Returns ``(kind, text, next_index)`` where kind is ``"sym"`` (a name to
-        resolve) or ``"val"`` (already-resolved text from a ``&&`` chain). A
-        single trailing ``.`` is a SAS name delimiter and is consumed, so
-        ``&prefix._&i`` resolves like ``prefix_&i``."""
-        j = amp_idx + 1
-        indirection = 0
-        while j < len(text) and text[j] == "&":
-            indirection += 1
-            j += 1
-        m = re.match(r"([A-Za-z_]\w*)", text[j:])
-        if not m:
-            return "none", "", amp_idx + 1
-        name = m.group(1)
-        j += m.end()
-        if j < len(text) and text[j] == ".":
-            j += 1  # consume the name-delimiter dot
-        if indirection:
-            val = self._symval(name, scope)
-            for _ in range(indirection - 1):
-                val = self._symval(val.strip(), scope)
-            return "val", val, j
-        return "sym", name, j
-
-    def _symval(self, name: str, scope: Dict[str, str]) -> str:
+        ``None`` is distinct from ``""``: an unbound reference must keep its
+        source text so a later rescan (or a later ``%let``) can still resolve
+        it, while a genuinely empty value must expand to nothing."""
         key = name.lower()
         val = scope.get(key)
         if val is None and scope is not self.symbols:
             val = self.symbols.get(key)
-        return val if val is not None else ""
+        return val
+
+    def _resolve_once(self, text: str, scope: Dict[str, str]) -> Tuple[str, bool]:
+        """One SAS symbol-resolution pass. Returns ``(text, changed)``.
+
+        ``&&`` collapses to a single ``&`` that survives into the next pass,
+        which is what makes the ``&&prefix&i`` indirection idiom name the
+        variable ``prefix<i>`` instead of concatenating two lookups."""
+        out: List[str] = []
+        changed = False
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch != "&":
+                out.append(ch)
+                i += 1
+                continue
+            if i + 1 < n and text[i + 1] == "&":
+                out.append("&")
+                i += 2
+                changed = True
+                continue
+            m = re.match(r"([A-Za-z_]\w*)", text[i + 1:])
+            if not m:
+                out.append(ch)
+                i += 1
+                continue
+            name = m.group(1)
+            j = i + 1 + m.end()
+            if j < n and text[j] == ".":
+                j += 1  # the name-delimiter dot is consumed, not emitted
+            val = self._symval(name, scope)
+            if val is None:
+                self.unresolved.add(name.lower())
+                out.append(text[i:j])   # leave the reference literal, SAS-style
+            else:
+                out.append(val)
+                changed = True
+            i = j
+        return "".join(out), changed
 
     def _resolve(self, text: str, scope: Dict[str, str]) -> str:
-        out = []
-        i = 0
-        while i < len(text):
-            if text[i] == "&":
-                kind, val, next_i = self._read_symref(text, i, scope)
-                if kind == "sym":
-                    out.append(self._symval(val, scope))
-                    i = next_i
-                    continue
-                if kind == "val":
-                    out.append(val)
-                    i = next_i
-                    continue
-            out.append(text[i])
-            i += 1
-        return "".join(out)
+        """Resolve ``&`` references, rescanning until the text stops changing."""
+        for _ in range(_MAX_RESCAN):
+            new, changed = self._resolve_once(text, scope)
+            if not changed or new == text:
+                return new
+            text = new
+        return text
 
     # ---- main expander ------------------------------------------------- #
     def _expand(self, text: str, scope: Dict[str, str], depth: int) -> str:
@@ -339,24 +548,14 @@ class MacroPreprocessor:
                 while j < len(text) and text[j] == " ":
                     j += 1
                 if name == "macro":
-                    spec_end = text.find(";", j)
-                    if spec_end == -1:
+                    if text.find(";", j) == -1:
                         out.append(text[i:])
                         break
-                    spec = text[j:spec_end].strip()
                     def_end = _matching_mend(text, i)
-                    body = text[spec_end + 1:def_end]
-                    mend_at = body.lower().rfind("%mend")
-                    if mend_at != -1:
-                        body = body[:mend_at]
-                    hm = re.match(r"([A-Za-z_]\w*)\s*(?:\((.*)\))?$", spec, flags=re.S)
-                    if not hm:
-                        i = def_end
-                        continue
-                    self.macros[hm.group(1).lower()] = {
-                        "params": _parse_params(hm.group(2) or ""),
-                        "body": body,
-                    }
+                    # Re-registering here (the collect pass already did it)
+                    # keeps SAS's sequential semantics for a redefinition:
+                    # invocations below this point see the newer body.
+                    self._register_macro(text[i:def_end])
                     i = def_end
                     continue
                 if name == "mend":
@@ -369,11 +568,34 @@ class MacroPreprocessor:
                         out.append(text[i:])
                         break
                     stmt = text[j:sem]
-                    vname, _, rest = stmt.partition("=")
+                    vname, eq, rest = stmt.partition("=")
                     vname = vname.strip().lower()
-                    if vname and rest:
-                        self.symbols[vname] = self._expand(rest.strip(), scope, depth + 1)
+                    if vname and eq:
+                        value = self._expand(rest.strip(), scope, depth + 1)
+                        # %let writes the global table unless the name was
+                        # declared %local (or is a parameter of the running
+                        # macro), which is what keeps two invocations of the
+                        # same macro from overwriting each other's names.
+                        if vname in scope.get(_LOCALS_KEY, ()):
+                            scope[vname] = value
+                        else:
+                            self.symbols[vname] = value
                     i = sem + 1
+                    continue
+                if name == "local":
+                    sem = text.find(";", j)
+                    if sem == -1:
+                        i = len(text)
+                        continue
+                    declared = scope.setdefault(_LOCALS_KEY, set())
+                    for nm in re.findall(r"[A-Za-z_]\w*", self._resolve(text[j:sem], scope)):
+                        declared.add(nm.lower())
+                        scope.setdefault(nm.lower(), "")
+                    i = sem + 1
+                    continue
+                if name in _DECL_STATEMENTS:
+                    sem = text.find(";", j)
+                    i = len(text) if sem == -1 else sem + 1
                     continue
                 if name == "include":
                     sem = text.find(";", j)
@@ -409,28 +631,22 @@ class MacroPreprocessor:
                     if name in _FUNCS:
                         out.append(self._call_func(name, arg_text, scope, depth))
                     else:
-                        out.append(self._invoke(name, arg_text, scope, depth))
+                        out.append(self._invoke(name, arg_text, scope, depth, text[i:after]))
                     i = after
                     continue
                 if name in _FUNCS:
                     out.append(self._call_func(name, "", scope, depth))
                     i = j
                     continue
-                out.append(self._invoke(name, "", scope, depth))
+                out.append(self._invoke(name, "", scope, depth, text[i:i + m.end()]))
                 i = j
                 continue
-            if text[i] == "&":
-                kind, val, next_i = self._read_symref(text, i, scope)
-                if kind == "sym":
-                    out.append(self._symval(val, scope))
-                    i = next_i
-                    continue
-                if kind == "val":
-                    out.append(val)
-                    i = next_i
-                    continue
-                out.append(ch)
-                i += 1
+            if ch == "&":
+                # Resolve the whole reference run at once (``&&tab&i`` is one
+                # run, not two lookups) and let _resolve rescan it.
+                run = re.match(r"[&\w.]+", text[i:]).group(0)
+                out.append(self._resolve(run, scope))
+                i += len(run)
                 continue
             out.append(ch)
             i += 1
@@ -461,7 +677,14 @@ class MacroPreprocessor:
             body = resolved.read_text(errors="replace")
         except Exception:
             return ""
-        return self._expand(_strip_macro_comments(body), scope, depth + 1)
+        body = _strip_macro_comments(body)
+        # Collect the included file's definitions first, for the same reason
+        # the top-level pass does: order of appearance must not decide whether
+        # a macro resolves.
+        lets = self._scan_definitions(body)
+        self._order_macros()
+        self._resolve_lets_topologically(lets)
+        return self._expand(body, scope, depth + 1)
 
     # ---- control flow --------------------------------------------------- #
     def _cond(self, expr: str, scope) -> bool:
@@ -643,9 +866,13 @@ class MacroPreprocessor:
         return len(text)
 
     # ---- macro invocation / functions ------------------------------------ #
-    def _invoke(self, name: str, args_text: str, scope, depth) -> str:
+    def _invoke(self, name: str, args_text: str, scope, depth, raw: str = "") -> str:
         if name not in self.macros:
-            return ""
+            # Every definition in the file was registered by the collect pass,
+            # so an unknown name is genuinely external (autocall library, a
+            # %sysfunc alias). Keep its source text rather than deleting code.
+            self.unresolved_macros.add(name)
+            return raw
         macro = self.macros[name]
         args_list = _split_commas(args_text) if args_text else []
         bind: Dict[str, str] = {}
@@ -660,7 +887,12 @@ class MacroPreprocessor:
             else:
                 positional.append(a)
         local = dict(scope)
+        # A macro gets a fresh local scope: its parameters are local in SAS,
+        # and %local declarations in its body must not leak to the caller.
+        declared = {p for p, _ in macro["params"]}
+        local[_LOCALS_KEY] = set(declared)
         for i, (pname, default) in enumerate(macro["params"]):
+            local[pname] = ""
             if pname in bind:
                 local[pname] = bind[pname]
             elif i < len(positional):
@@ -671,8 +903,14 @@ class MacroPreprocessor:
 
     def _call_func(self, name: str, arg_text: str, scope, depth) -> str:
         try:
-            if name in ("str", "nrstr", "bquote", "quote", "nrbquote", "dequote"):
+            if name == "nrstr":
+                # %nrstr is the one that masks & and %: its argument must not
+                # be resolved, which is how a literal ``&`` survives.
                 return arg_text
+            if name in ("str", "bquote", "quote", "nrbquote", "dequote"):
+                # These mask special characters but still resolve references,
+                # so ``%let t = %str(&lib..tab);`` yields a real table name.
+                return self._expand(arg_text, scope, depth + 1)
             if name in ("unquote", "unquote3"):
                 return self._resolve(arg_text, scope)
             if name in ("eval", "sysevalf"):
@@ -847,11 +1085,24 @@ def preprocess(code: str, include_base: Optional[str] = None) -> str:
 
     ``%include`` is only resolved when ``include_base`` is supplied, and only
     for files that stay under that directory."""
+    return preprocess_ex(code, include_base)[0]
+
+
+def preprocess_ex(code: str, include_base: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+    """``preprocess`` plus the expander's diagnostics.
+
+    The second element carries the topological orders that were used, the
+    dependency cycles that could not be linearised, and the names that stayed
+    unresolved -- which is what lets a caller tell a table name it *knows* from
+    one it merely copied through."""
     raw = code
+    pre = MacroPreprocessor(include_base)
     try:
-        out = MacroPreprocessor(include_base).preprocess(code)
-    except Exception:
-        return raw
+        out = pre.preprocess(code)
+    except Exception as exc:  # never let a macro edge case kill the parse
+        return raw, {"error": f"{type(exc).__name__}: {exc}"}
+    report = pre.report()
     if _has_steps(raw) and not _has_steps(out):
-        return raw
-    return out
+        report["fallback"] = "expansion produced no step; source returned unexpanded"
+        return raw, report
+    return out, report

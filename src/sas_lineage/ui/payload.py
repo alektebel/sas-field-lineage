@@ -114,18 +114,19 @@ def _all_tables(program: SASProgram) -> Tuple[Set[str], List[Tuple[str, str]]]:
     tables: Set[str] = set()
     edges: List[Tuple[str, str]] = []
     for ds in program.data_steps:
-        out = ds.output_table
-        tables.add(out)
+        outs = ds.output_tables or ([ds.output_table] if ds.output_table else [])
+        tables.update(outs)
         for inp in ds.input_tables:
             tables.add(inp)
-            edges.append((inp, out))
+            for out in outs:
+                edges.append((inp, out))
     for ps in program.proc_steps:
-        if ps.input_table:
-            tables.add(ps.input_table)
-        if ps.output_table:
-            tables.add(ps.output_table)
-            if ps.input_table:
-                edges.append((ps.input_table, ps.output_table))
+        tables.update(ps.input_tables)
+        tables.update(ps.output_tables)
+        for out in ps.output_tables:
+            for inp in ps.input_tables:
+                if inp != out:
+                    edges.append((inp, out))
     return tables, edges
 
 
