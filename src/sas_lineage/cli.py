@@ -63,6 +63,19 @@ def main():
     )
 
     parser.add_argument(
+        '--trace',
+        action='store_true',
+        help='Print a stage-by-stage trace (symbols, expansion, statements, tables, '
+             'invented names) instead of parsing for lineage'
+    )
+
+    parser.add_argument(
+        '--trace-statements',
+        action='store_true',
+        help='Include the statement stream in --trace output'
+    )
+
+    parser.add_argument(
         '--include-base',
         type=str,
         help='Sandbox directory for %include (requires --expand-macros; reads below this directory only)'
@@ -78,7 +91,12 @@ def main():
     
     with open(sas_file_path, 'r') as f:
         sas_code = f.read()
-    
+
+    if args.trace:
+        from .debug import trace
+        print(trace(sas_code, show_statements=args.trace_statements))
+        return 0
+
     # Parse SAS code
     print(f"Parsing {args.sas_file}...")
     expand = args.expand_macros or bool(args.include_base)
