@@ -111,7 +111,19 @@ sas-lineage examples/sales_analysis.sas --expand-macros
 
 # Expand macros and resolve %include only below a sandbox directory
 sas-lineage examples/sales_analysis.sas --include-base examples/includes
+
+# Ordered table references, resolution diagnostics and dataset versions (JSON)
+sas-lineage examples/table_resolution.sas --tables -o tables.json
+
+# Emit the report and exit 2 if resolution is partial
+sas-lineage examples/table_resolution.sas --tables --strict
 ```
+
+The new [table-resolution report](docs/TABLE_ANALYSIS.md) preserves qualified
+names, DATA/PROC order, explicit multiple outputs and symbolic macro names.
+It distinguishes source evidence from heuristic macro expansion and exposes
+unsupported/runtime-dependent behavior. Its versioned logical dataset graph
+is an analysis aid; it does not yet establish a safe program execution order.
 
 ## How It Works
 

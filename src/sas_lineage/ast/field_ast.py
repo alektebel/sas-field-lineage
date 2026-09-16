@@ -1,9 +1,10 @@
 """
 Abstract Syntax Tree representation for SAS field dependencies
 """
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Union
 from dataclasses import dataclass, field
 from enum import Enum
+from .table_ast import Diagnostic, TableReference
 
 
 class FieldOperationType(Enum):
@@ -77,6 +78,13 @@ class DataStepNode:
     fields: List[FieldNode] = field(default_factory=list)
     where_clause: Optional[str] = None
     merge_keys: List[str] = field(default_factory=list)
+    output_tables: List[str] = field(default_factory=list)
+    table_references: List[TableReference] = field(default_factory=list)
+    source_line: Optional[int] = None
+
+    def __post_init__(self):
+        if not self.output_tables and self.output_table.lower() != '_null_':
+            self.output_tables = [self.output_table]
     
     def add_field(self, field_node: FieldNode):
         """Add a field to this data step"""
@@ -98,6 +106,8 @@ class ProcStepNode:
     output_table: Optional[str] = None
     fields: List[FieldNode] = field(default_factory=list)
     options: Dict[str, Any] = field(default_factory=dict)
+    table_references: List[TableReference] = field(default_factory=list)
+    source_line: Optional[int] = None
 
 
 class SASProgram:
@@ -106,11 +116,15 @@ class SASProgram:
     def __init__(self):
         self.data_steps: List[DataStepNode] = []
         self.proc_steps: List[ProcStepNode] = []
+        self.steps: List[Union[DataStepNode, ProcStepNode]] = []
+        self.diagnostics: List[Diagnostic] = []
+        self.coordinate_space = 'source'
         self.all_fields: Dict[str, List[FieldNode]] = {}  # field_name -> [FieldNode instances]
     
     def add_data_step(self, data_step: DataStepNode):
         """Add a data step to the program"""
         self.data_steps.append(data_step)
+        self.steps.append(data_step)
         # Index fields for quick lookup
         for field_node in data_step.fields:
             if field_node.name not in self.all_fields:
@@ -120,6 +134,7 @@ class SASProgram:
     def add_proc_step(self, proc_step: ProcStepNode):
         """Add a proc step to the program"""
         self.proc_steps.append(proc_step)
+        self.steps.append(proc_step)
     
     def find_field(self, field_name: str, table_name: Optional[str] = None) -> List[FieldNode]:
         """Find all instances of a field by name and optionally table"""
@@ -139,9 +154,10 @@ class SASProgram:
         """Get all table names in the program"""
         tables = set()
         for ds in self.data_steps:
-            tables.add(ds.output_table)
+            tables.update(ds.output_tables)
             tables.update(ds.input_tables)
         for ps in self.proc_steps:
+            tables.update(ref.name for ref in ps.table_references)
             if ps.input_table:
                 tables.add(ps.input_table)
             if ps.output_table:

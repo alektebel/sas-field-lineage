@@ -7,11 +7,11 @@ import sys
 from pathlib import Path
 
 try:
-    from ..parser import SASParser
-    from ..lineage import LineageTracker, FieldEvaluator
+    from .parser import SASParser
+    from .analysis import build_table_report
 except ImportError:
     from sas_lineage.parser import SASParser
-    from sas_lineage.lineage import LineageTracker, FieldEvaluator
+    from sas_lineage.analysis import build_table_report
 
 
 def main():
@@ -59,16 +59,27 @@ def main():
     parser.add_argument(
         '--expand-macros',
         action='store_true',
-        help='Expand the supported deterministic %macro subset before parsing'
+        help='Expand the supported deterministic %%macro subset before parsing'
     )
 
     parser.add_argument(
         '--include-base',
         type=str,
-        help='Sandbox directory for %include (requires --expand-macros; reads below this directory only)'
+        help='Sandbox directory for %%include (requires --expand-macros; reads below this directory only)'
     )
 
+    parser.add_argument('--tables', action='store_true',
+                        help='Emit an ordered table-resolution report as JSON, with diagnostics and dataset versions')
+    parser.add_argument('--strict', action='store_true',
+                        help='With --tables, exit 2 when analysis is partial (the JSON report is still emitted)')
+    parser.add_argument('--default-library',
+                        help='Explicit logical library for one-level names in --tables (no default is assumed)')
+
     args = parser.parse_args()
+    if args.tables and (args.query or args.browse or args.graph):
+        parser.error('--tables cannot be combined with --query, --browse or --graph')
+    if (args.strict or args.default_library) and not args.tables:
+        parser.error('--strict and --default-library require --tables')
     
     # Read SAS file
     sas_file_path = Path(args.sas_file)
@@ -76,15 +87,40 @@ def main():
         print(f"Error: File '{args.sas_file}' not found", file=sys.stderr)
         return 1
     
-    with open(sas_file_path, 'r') as f:
-        sas_code = f.read()
+    try:
+        sas_code = sas_file_path.read_text(encoding='utf-8')
+    except (OSError, UnicodeError) as error:
+        print(f'Error reading {sas_file_path}: {error}', file=sys.stderr)
+        return 1
     
     # Parse SAS code
-    print(f"Parsing {args.sas_file}...")
+    if not args.tables:
+        print(f"Parsing {args.sas_file}...")
     expand = args.expand_macros or bool(args.include_base)
     include_base = args.include_base if expand else None
     parser_obj = SASParser()
     program = parser_obj.parse(sas_code, expand_macros=expand, include_base=include_base)
+    if args.tables:
+        try:
+            result = build_table_report(program, str(sas_file_path), args.default_library)
+        except ValueError as error:
+            parser.error(str(error))
+        rendered = json.dumps(result, indent=2)
+        print(rendered)
+        if args.output:
+            try:
+                Path(args.output).write_text(rendered + '\n', encoding='utf-8')
+            except OSError as error:
+                print(f'Error writing report: {error}', file=sys.stderr)
+                return 1
+        return 2 if args.strict and result['status'] == 'partial' else 0
+
+    # Table reports need only the standard library; field evaluation has
+    # optional pandas/networkx dependencies loaded by the lineage package.
+    if __package__:
+        from .lineage import LineageTracker
+    else:
+        from sas_lineage.lineage import LineageTracker
     tracker = LineageTracker(program)
     
     print(f"Found {len(program.get_all_fields())} fields in {len(program.data_steps)} data steps")

@@ -1,14 +1,17 @@
-"""
-Simplified SAS parser using regex patterns
-This parser handles common SAS DATA step and PROC step patterns
+"""SAS step parser with token-aware table references and explicit diagnostics.
+
+Field expressions still use the legacy heuristic extractor. Table analysis
+records its unsupported constructs rather than claiming full SAS semantics.
 """
 import re
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple
 from ..ast.field_ast import (
     FieldNode, FieldOperationType, DataStepNode, 
     ProcStepNode, SASProgram
 )
 from .preprocessor import preprocess
+from ..ast.table_ast import Diagnostic, TableReference
+from .scanner import dataset_list, dataset_options, read_name, scan_statements, strip_comments, tokenize
 
 # Common SAS keywords and functions that should not be treated as field references
 SAS_KEYWORDS = {
@@ -47,28 +50,53 @@ class SASParser:
         Included files are read from that directory (or below) only.
         """
         program = SASProgram()
+        self.program = program
         if expand_macros:
             sas_code = preprocess(sas_code, include_base=include_base)
-        stmts = self._tokenize(sas_code)
+            program.coordinate_space = 'expanded'
+            program.diagnostics.append(Diagnostic(
+                'heuristic_macro_expansion',
+                'Legacy macro expansion is approximate; names are candidates, not verified runtime names. '
+                'Line numbers refer to expanded text, not original macro definitions.'))
+        scanned, issues = scan_statements(sas_code)
+        program.diagnostics.extend(Diagnostic(x.code, x.message, x.line) for x in issues)
+        stmts = [(stmt.text, stmt.line) for stmt in scanned]
 
         i = 0
+        macro_depth = 0
         while i < len(stmts):
             text, line = stmts[i]
             self.current_line = line
-            upper = text.upper()
+            tokens = tokenize(text)
+            upper = tokens[0].upper if tokens else ''
             if not text:
                 i += 1
                 continue
-            if upper.startswith('DATA '):
+            if re.match(r'%macro\b', text, re.I):
+                macro_depth += 1
+                self._diagnostic('unexpanded_macro', 'Macro definition requires expansion; its body is not an executed step.', line)
+            elif re.match(r'%mend\b', text, re.I):
+                macro_depth = max(0, macro_depth - 1)
+            elif macro_depth:
+                pass
+            elif upper == 'DATA':
                 data_step, i = self._parse_data_step(stmts, i)
                 if data_step:
                     program.add_data_step(data_step)
                 continue
-            if upper.startswith('PROC '):
+            elif upper == 'PROC':
                 proc_step, i = self._parse_proc_step(stmts, i)
                 if proc_step:
                     program.add_proc_step(proc_step)
                 continue
+            elif text.startswith('%'):
+                self._diagnostic('unexpanded_macro', 'Macro statement or invocation is not resolved.', line)
+            elif upper in {'LIBNAME', 'FILENAME', 'OPTIONS'}:
+                self._diagnostic('session_configuration', 'Session configuration is recorded only as a limitation; physical library/file identities are not resolved.', line)
+            elif upper == 'ODS':
+                self._diagnostic('unsupported_io', 'ODS output datasets and destinations are not modeled.', line)
+            elif upper not in {'', 'RUN', 'QUIT', 'TITLE', 'FOOTNOTE'}:
+                self._diagnostic('unsupported_statement', 'Open-code statement is not modeled: ' + tokens[0].text, line)
             i += 1
 
         return program
@@ -81,45 +109,40 @@ class SASParser:
         ``datalines``/``cards`` (and ``*4`` variants) blocks are consumed as
         opaque data so their rows are never mistaken for code.
         """
-        text = SASCodeCleaner.remove_comments(sas_code)
-        stmts: List[Tuple[str, int]] = []
-        cur = ""
-        cur_line = 0
-        cards = False
+        statements, _ = scan_statements(sas_code)
+        return [(stmt.text, stmt.line) for stmt in statements]
 
-        for ln_idx, raw in enumerate(text.split("\n"), start=1):
-            line = raw
-            while line:
-                if cards:
-                    j = line.find(";")
-                    if j == -1:
-                        line = ""           # consume whole card-data line
-                    else:
-                        line = line[j + 1:]
-                        cards = False
-                    continue
-                j = line.find(";")
-                if j == -1:
-                    if not cur_line:
-                        cur_line = ln_idx
-                    cur = (cur + " " + line).strip() if cur else line.strip()
-                    break
-                piece = line[:j].strip()
-                if not cur_line:
-                    cur_line = ln_idx
-                cur = (cur + " " + piece).strip() if cur else piece
-                stmt_text = cur.strip()
-                stmt_line = cur_line
-                cur, cur_line = "", 0
-                if stmt_text:
-                    stmts.append((stmt_text, stmt_line))
-                    # A bare datalines/cards statement opens an inline data block.
-                    if re.match(r"^(DATALINES4?|CARDS4?)\s*$", stmt_text.upper()):
-                        cards = True
-                line = line[j + 1:]
-        if cur.strip():
-            stmts.append((cur.strip(), cur_line or 1))
-        return stmts
+    def _diagnostic(self, code: str, message: str, line: int):
+        self.program.diagnostics.append(Diagnostic(code, message, line))
+
+    def _reference(self, step, name: str, access: str, line: int):
+        if name.lower() == '_null_':
+            return
+        tokens = tokenize(name)
+        symbolic = any(token.kind == 'macro' for token in tokens)
+        # Double-quoted name literals can also contain active macro triggers.
+        symbolic = symbolic or any(
+            token.kind == 'name_literal' and token.text.startswith('"')
+            and re.search(r'[&%][A-Za-z_]', token.text) for token in tokens)
+        reason = 'Unresolved macro expression in dataset name.' if symbolic else None
+        resolution = 'symbolic' if symbolic else 'literal'
+        if not symbolic and (name.lower() in {'_last_', '_data_', '_all_'}
+                             or sum(token.text == '.' for token in tokens) > 1):
+            resolution = 'unknown'
+            reason = 'Session-dependent or unsupported dataset name.'
+            self._diagnostic('unsupported_table_name', reason + ' ' + name, line)
+        step.table_references.append(TableReference(
+            name, access, line, resolution, reason))
+        if symbolic:
+            self._diagnostic('unresolved_table_name', reason + ' ' + name, line)
+
+    def _runtime_effects(self, statement: str, line: int):
+        words = [token.upper for token in tokenize(statement)]
+        if any(word in {'SYMPUT', 'SYMPUTX', 'SYMGET', 'EXECUTE', 'DOSUBL', 'RESOLVE'} for word in words):
+            self._diagnostic('runtime_macro_effect',
+                             'Runtime macro state or generated code requires execution evidence; it is not evaluated.', line)
+        if any(token.kind == 'macro' and token.text.startswith('%') for token in tokenize(statement)):
+            self._diagnostic('unexpanded_macro', 'Macro code within the step is not resolved.', line)
     
     def _parse_data_step(self, stmts, start_line: int) -> Tuple[Optional[DataStepNode], int]:
         """
@@ -127,42 +150,60 @@ class SASParser:
         index just after its terminator (``RUN;``/``QUIT;``).
         """
         text, line = stmts[start_line]
-        match = re.search(r'DATA\s+(\w+)', text, re.IGNORECASE)
-        if not match:
+        tokens = tokenize(text)
+        names, incomplete = dataset_list(text[tokens[0].end:])
+        if incomplete:
+            self._diagnostic('unsupported_dataset_list', 'DATA output list could not be fully resolved.', line)
+        if not names:
+            self._diagnostic('missing_output_name', 'DATA statement has no supported output dataset name.', line)
             return None, start_line + 1
 
-        output_table = match.group(1)
-        data_step = DataStepNode(output_table=output_table)
+        output_table = names[0]
+        data_step = DataStepNode(output_table=output_table,
+                                 output_tables=[name for name in names if name.lower() != '_null_'],
+                                 source_line=line)
+        for name in names:
+            self._reference(data_step, name, 'write', line)
+        if any(option == 'VIEW' for option, _ in dataset_options(text, ('VIEW',))):
+            self._diagnostic('deferred_view', 'DATA-step view execution and deferred dependencies are not modeled.', line)
 
         i = start_line + 1
         while i < len(stmts):
             stmt, ln = stmts[i]
-            upper = stmt.upper()
+            tokens = tokenize(stmt)
+            upper = tokens[0].upper if tokens else ''
+            if upper in {'DATA', 'PROC'}:
+                break  # A new step also terminates the preceding step.
             # Terminators end the step (RUN; or QUIT;).
-            if upper.startswith('RUN') or upper.startswith('QUIT'):
+            if upper in {'RUN', 'QUIT'}:
                 i += 1
                 break
             # A datalines/cards block is opaque data — nothing to extract.
-            if re.match(r'^(DATALINES4?|CARDS4?)\b', upper):
+            if upper in {'DATALINES', 'DATALINES4', 'CARDS', 'CARDS4'}:
                 i += 1
-                break
+                continue
 
-            if upper.startswith('SET '):
-                set_match = re.search(r'SET\s+([\w\s]+)', stmt, re.IGNORECASE)
-                if set_match:
-                    data_step.input_tables.extend(
-                        t for t in set_match.group(1).split() if t.strip())
-            elif upper.startswith('MERGE '):
-                merge_match = re.search(r'MERGE\s+([\w\s]+)', stmt, re.IGNORECASE)
-                if merge_match:
-                    data_step.input_tables.extend(
-                        t for t in merge_match.group(1).split() if t.strip())
-            elif upper.startswith('BY '):
+            self._runtime_effects(stmt, ln)
+            if upper not in {'SET', 'MERGE', 'UPDATE', 'MODIFY'} and any(
+                    token.upper in {'SET', 'MERGE', 'UPDATE', 'MODIFY'} for token in tokens):
+                self._diagnostic('conditional_dataset_io', 'Embedded or conditional dataset I/O is not fully resolved.', ln)
+            if upper in {'SET', 'MERGE', 'UPDATE', 'MODIFY'}:
+                inputs, incomplete = dataset_list(stmt[tokens[0].end:])
+                data_step.input_tables.extend(inputs)
+                for name in inputs:
+                    self._reference(data_step, name, 'read', ln)
+                if incomplete:
+                    self._diagnostic('unsupported_dataset_list', 'Dataset prefix/range list or dynamic expression needs catalog-aware resolution.', ln)
+                if upper in {'UPDATE', 'MODIFY'}:
+                    self._diagnostic('unsupported_mutation', upper + ' mutation semantics are not modeled.', ln)
+            elif upper == 'BY':
                 by_match = re.search(r'BY\s+([\w\s]+)', stmt, re.IGNORECASE)
                 if by_match:
                     data_step.merge_keys.extend(k for k in by_match.group(1).split() if k.strip())
             else:
-                assignment_match = re.search(r'(\w+)\s*=\s*(.+)', stmt)
+                if upper in {'DECLARE', 'DCL', 'INFILE', 'FILE', 'ODS'}:
+                    self._diagnostic('unsupported_io', 'Hash-object or external-file I/O is not modeled.', ln)
+                assignment_match = re.match(r'(\w+)\s*=\s*(.+)', stmt, re.S)
                 if assignment_match:
                     field_name = assignment_match.group(1)
                     expression = assignment_match.group(2).strip()
@@ -194,29 +235,60 @@ class SASParser:
             return None, start_line + 1
 
         proc_name = match.group(1).upper()
-        proc_step = ProcStepNode(proc_name=proc_name)
+        proc_step = ProcStepNode(proc_name=proc_name, source_line=line)
+        if proc_name not in {'SORT', 'PRINT', 'CONTENTS', 'MEANS', 'SUMMARY', 'FREQ', 'APPEND'}:
+            self._diagnostic('unsupported_procedure',
+                             'Procedure effects are only partially extracted: ' + proc_name, line)
 
-        i = start_line + 1
+        explicit_sort_output = False
+        i = start_line
         while i < len(stmts):
             stmt, ln = stmts[i]
-            upper = stmt.upper()
-            if upper.startswith('RUN') or upper.startswith('QUIT'):
+            tokens = tokenize(stmt)
+            upper = tokens[0].upper if tokens else ''
+            if i > start_line and upper in {'DATA', 'PROC'}:
+                break
+            if upper == 'QUIT' or (upper == 'RUN' and proc_name not in {'SQL', 'DATASETS'}):
                 i += 1
                 break
 
-            # Extract DATA= option
-            data_match = re.search(r'DATA\s*=\s*(\w+)', stmt, re.IGNORECASE)
-            if data_match:
-                proc_step.input_table = data_match.group(1)
-
-            # Extract OUT= option
-            out_match = re.search(r'OUT\s*=\s*(\w+)', stmt, re.IGNORECASE)
-            if out_match:
-                proc_step.output_table = out_match.group(1)
+            self._runtime_effects(stmt, ln)
+            if upper == 'ODS':
+                self._diagnostic('unsupported_io', 'ODS output datasets and destinations are not modeled.', ln)
+            for option, name in dataset_options(stmt, ('DATA', 'OUT', 'BASE', 'DUPOUT', 'OUTP', 'OUTEST')):
+                if option == 'OUT':
+                    explicit_sort_output = True
+                if option in {'DATA', 'BASE'}:
+                    proc_step.input_table = proc_step.input_table or name
+                    self._reference(proc_step, name, 'read', ln)
+                if option != 'DATA':
+                    proc_step.output_table = proc_step.output_table or name
+                    self._reference(proc_step, name, 'write', ln)
+            if proc_name == 'SQL':
+                self._sql_references(proc_step, tokens, ln)
 
             i += 1
 
+        if proc_name == 'SORT' and proc_step.input_table and not explicit_sort_output:
+            proc_step.output_table = proc_step.input_table
+            self._reference(proc_step, proc_step.output_table, 'write', line)
+        if not proc_step.input_table and proc_name in {'SORT', 'PRINT', 'CONTENTS', 'MEANS', 'SUMMARY', 'FREQ'}:
+            self._diagnostic('implicit_input', 'Procedure default input depends on session state.', line)
         return proc_step, i
+
+    def _sql_references(self, step, tokens, line):
+        """Recover basic SQL references; unsupported_procedure marks partiality."""
+        for index, token in enumerate(tokens):
+            access = None
+            after = index + 1
+            if token.upper in {'FROM', 'JOIN'}:
+                access = 'read'
+            elif token.upper == 'TABLE' and index and tokens[index - 1].upper == 'CREATE':
+                access = 'write'
+            if access:
+                name, _ = read_name(tokens, after)
+                if name:
+                    self._reference(step, name, access, line)
     
     def _extract_field_references(self, expression: str, source_tables: List[str]) -> List[Tuple[str, Optional[str]]]:
         """
@@ -256,11 +328,7 @@ class SASCodeCleaner:
     @staticmethod
     def remove_comments(code: str) -> str:
         """Remove comments from SAS code"""
-        # Remove /* */ style comments
-        code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
-        # Remove * style comments (line comments)
-        code = re.sub(r'^\s*\*[^;]*;', '', code, flags=re.MULTILINE)
-        return code
+        return strip_comments(code)
     
     @staticmethod
     def normalize_whitespace(code: str) -> str:

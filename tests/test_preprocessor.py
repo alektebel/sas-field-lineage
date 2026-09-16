@@ -15,8 +15,8 @@ class TestMacroPreprocessor(unittest.TestCase):
     def test_let_and_symbol_resolution(self):
         code = "%let lib = stg;\ndata &lib..raw;\n  set &lib..src;\n  y = 100;\nrun;\n"
         prog = self.parser.parse(code, expand_macros=True)
-        self.assertEqual(prog.data_steps[0].output_table, "stg")
-        self.assertIn("stg", prog.data_steps[0].input_tables)
+        self.assertEqual(prog.data_steps[0].output_table, "stg.raw")
+        self.assertIn("stg.src", prog.data_steps[0].input_tables)
 
     def test_macro_loop_generates_data_steps(self):
         code = """
@@ -127,6 +127,29 @@ class TestMacroPreprocessor(unittest.TestCase):
             # Traversal outside include_base is ignored.
             prog = self.parser.parse('%include "../part.sas";', expand_macros=True, include_base=base)
             self.assertEqual(prog.data_steps, [])
+
+    def test_unknown_symbol_and_unknown_macro_are_preserved(self):
+        code = 'data sales_&period.; set &lib..source; run; %external(a,b);'
+        self.assertEqual(preprocess(code), code)
+
+    def test_quote_context_and_doubled_quotes(self):
+        code = '''%let period=202609; data out;
+        x='&period'; y="&period"; z='it''s &period';
+        label="it's &period"; run;'''
+        expanded = preprocess(code)
+        self.assertIn("x='&period'", expanded)
+        self.assertIn('y="202609"', expanded)
+        self.assertIn("z='it''s &period'", expanded)
+        self.assertIn('label="it\'s 202609"', expanded)
+
+    def test_comment_markers_in_literals_survive(self):
+        expanded = preprocess("%let x=a; data out; y='/* &x */'; z='%* text;'; run;")
+        self.assertIn("y='/* &x */'", expanded)
+        self.assertIn("z='%* text;'", expanded)
+
+    def test_empty_let_clears_existing_value(self):
+        expanded = preprocess('%let suffix=old; %let suffix=; data out&suffix.; run;')
+        self.assertIn('data out;', expanded)
 
 
 if __name__ == "__main__":

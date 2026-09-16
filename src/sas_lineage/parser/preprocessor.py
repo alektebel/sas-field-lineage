@@ -31,6 +31,7 @@ import operator
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from .scanner import quoted_end, strip_comments
 
 _KEYWORDS = {
     "macro", "mend", "let", "put", "if", "then", "else",
@@ -57,9 +58,7 @@ _MAX_ITERS = 40000
 
 
 def _strip_macro_comments(text: str) -> str:
-    text = re.sub(r"%\*.*?;", " ", text, flags=re.DOTALL)          # %* ... ;
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)        # /* ... */
-    return text
+    return strip_comments(text)
 
 
 def _balanced(text: str, open_idx: int) -> Tuple[str, int]:
@@ -289,6 +288,8 @@ class MacroPreprocessor:
             for _ in range(indirection - 1):
                 val = self._symval(val.strip(), scope)
             return "val", val, j
+        if name.lower() not in scope and name.lower() not in self.symbols:
+            return "val", text[amp_idx:j], j
         return "sym", name, j
 
     def _symval(self, name: str, scope: Dict[str, str]) -> str:
@@ -296,7 +297,7 @@ class MacroPreprocessor:
         val = scope.get(key)
         if val is None and scope is not self.symbols:
             val = self.symbols.get(key)
-        return val if val is not None else ""
+        return val if val is not None else "&" + name
 
     def _resolve(self, text: str, scope: Dict[str, str]) -> str:
         out = []
@@ -323,11 +324,19 @@ class MacroPreprocessor:
         out = []
         i = 0
         iters = 0
+        double_quoted = False
         while i < len(text):
             iters += 1
             if iters > _MAX_ITERS:
                 return "".join(out) + text[i:]
             ch = text[i]
+            if ch == '"':
+                double_quoted = not double_quoted
+            if ch == "'" and not double_quoted:
+                after = quoted_end(text, i)
+                out.append(text[i:after])
+                i = after
+                continue
             if ch == "%":
                 m = re.match(r"%([A-Za-z_]\w*)", text[i:])
                 if not m:
@@ -371,7 +380,7 @@ class MacroPreprocessor:
                     stmt = text[j:sem]
                     vname, _, rest = stmt.partition("=")
                     vname = vname.strip().lower()
-                    if vname and rest:
+                    if vname and '=' in stmt:
                         self.symbols[vname] = self._expand(rest.strip(), scope, depth + 1)
                     i = sem + 1
                     continue
@@ -408,15 +417,17 @@ class MacroPreprocessor:
                     arg_text, after = _balanced(text, j)
                     if name in _FUNCS:
                         out.append(self._call_func(name, arg_text, scope, depth))
-                    else:
+                    elif name in self.macros:
                         out.append(self._invoke(name, arg_text, scope, depth))
+                    else:
+                        out.append(text[i:after])
                     i = after
                     continue
                 if name in _FUNCS:
                     out.append(self._call_func(name, "", scope, depth))
                     i = j
                     continue
-                out.append(self._invoke(name, "", scope, depth))
+                out.append(self._invoke(name, "", scope, depth) if name in self.macros else text[i:j])
                 i = j
                 continue
             if text[i] == "&":
