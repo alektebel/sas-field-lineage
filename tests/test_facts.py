@@ -70,5 +70,34 @@ class TestFieldFacts(unittest.TestCase):
         self.assertIn('"flows"', msg)
 
 
+
+class TestModelAnswerGuard(unittest.TestCase):
+    """The leak check must not reject an answer for naming a real table."""
+
+    def test_token_regex_matches_a_three_part_field_id(self):
+        from src.sas_lineage.ui.server import _FIELD_TOKEN_RE
+        # Now that two-level table names are kept, a field id is
+        # libref.member.field; a two-part pattern captured only libref.member.
+        self.assertIn("bsgl.c20.revenue",
+                      _FIELD_TOKEN_RE.findall("1. bsgl.c20.revenue = qty * price"))
+
+    def test_a_faithful_answer_passes_the_guard(self):
+        from src.sas_lineage.parser import SASParser
+        from src.sas_lineage.ui.facts import FieldFacts
+        from src.sas_lineage.ui.server import _FIELD_TOKEN_RE
+        prog = SASParser().parse(
+            "data bsgl.c19; set raw.feed; qty = units; run;\n"
+            "data bsgl.c20; set bsgl.c19; revenue = qty; run;")
+        facts = FieldFacts(prog)
+        pack = facts.packet("construction", "bsgl.c20.revenue")
+        self.assertIsNotNone(pack)
+        universe = {u.lower() for u in facts.packet_universe(pack)}
+        cited = {t.lower() for t in _FIELD_TOKEN_RE.findall(facts.render_answer(pack))}
+        self.assertTrue(cited)
+        # Before the fix this set difference was non-empty for every program
+        # using librefs, so the SLM answer was always thrown away.
+        self.assertTrue(cited <= universe, f"rejected: {sorted(cited - universe)}")
+
+
 if __name__ == "__main__":
     unittest.main()

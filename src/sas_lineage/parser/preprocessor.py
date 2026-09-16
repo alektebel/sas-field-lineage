@@ -341,6 +341,14 @@ class MacroPreprocessor:
     def _resolve_globals(self, text: str) -> None:
         """Resolve ``%let`` values in dependency order (DFS topological sort)."""
         latest: Dict[str, str] = {}
+        # ``call symput`` only creates the symbol when its DATA step runs, and
+        # this pass does not run DATA steps -- so without seeding it here every
+        # table name built from the symbol stays unresolved. Only a *literal*
+        # value is taken: anything computed from the data cannot be known
+        # statically, and guessing would be worse than flagging it. A %let on
+        # the same name wins, since it is read second.
+        for match in _SYMPUT_LITERAL_RE.finditer(text):
+            latest[match.group("name").lower()] = match.group("value").strip()
         for match in _LET_STMT_RE.finditer(self._mask_macro_bodies(text)):
             latest[match.group(1).lower()] = match.group(2).strip()
         if not latest:
@@ -950,6 +958,13 @@ def _has_steps(text: str) -> bool:
 
 _SYMREF_RE = re.compile(r"(&+)([A-Za-z_]\w*)\.?")
 _LET_STMT_RE = re.compile(r"%\s*let\s+([A-Za-z_]\w*)\s*=\s*(.*?);", re.IGNORECASE | re.DOTALL)
+
+# ``call symput('name', 'literal')`` -- the one run-time assignment whose value
+# is knowable without running the DATA step that makes it.
+_SYMPUT_LITERAL_RE = re.compile(
+    r"""\bcall\s+symputx?\s*\(\s*(['"])(?P<name>[^'"]+)\1\s*,\s*(['"])(?P<value>[^'"]*)\3\s*\)""",
+    re.IGNORECASE,
+)
 
 
 def _substitute_symbols(text: str, symbols: Dict[str, str]) -> str:

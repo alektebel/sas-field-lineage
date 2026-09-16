@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from src.sas_lineage.parser import SASParser
-from src.sas_lineage.parser.preprocessor import preprocess
+from src.sas_lineage.parser.preprocessor import expand_for_report, preprocess
 
 
 class TestMacroPreprocessor(unittest.TestCase):
@@ -144,6 +144,28 @@ class TestMacroPreprocessor(unittest.TestCase):
             # Traversal outside include_base is ignored.
             prog = self.parser.parse('%include "../part.sas";', expand_macros=True, include_base=base)
             self.assertEqual(prog.data_steps, [])
+
+
+    def test_literal_call_symput_defines_the_symbol(self):
+        # SAS only creates it when the DATA step runs; without seeding it the
+        # library name below never resolves.
+        code = ("data _null_; call symputx('lib', 'BSGL'); run;\n"
+                "data &lib..c20; set &lib..c19; x = 1; run;\n")
+        prog = self.parser.parse(code, expand_macros=True)
+        self.assertEqual(prog.data_steps[1].output_table, "BSGL.c20")
+
+    def test_computed_call_symput_is_not_guessed(self):
+        code = ("data _null_; call symput('lib', trim(nm)); run;\n"
+                "data &lib..c20; set s; x = 1; run;\n")
+        out = expand_for_report(code)
+        self.assertIn("&lib", out)
+
+    def test_a_later_let_wins_over_a_symput_of_the_same_name(self):
+        code = ("data _null_; call symputx('lib', 'OLD'); run;\n"
+                "%let lib = NEW;\n"
+                "data &lib..c20; set s; x = 1; run;\n")
+        prog = self.parser.parse(code, expand_macros=True)
+        self.assertEqual(prog.data_steps[1].output_table, "NEW.c20")
 
 
 if __name__ == "__main__":

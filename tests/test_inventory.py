@@ -183,20 +183,19 @@ class TestXlsxWriter(unittest.TestCase):
         self.assertEqual(_col_letter(27), "AA")
         self.assertEqual(_col_letter(28), "AB")
 
-    def test_inventory_sheets_group_by_division(self):
+    def test_all_tables_share_one_sheet_with_the_division_as_a_column(self):
         inv = build_inventory("libname mrt 'x';\ndata mrt.t; set raw.src; x=1; run;\n")
         sheets = inventory_sheets(inv)
         names = [name for name, _rows in sheets]
-        self.assertIn("Libraries", names)
-        self.assertIn("Summary", names)
-        # one hop from its source -> Landing division sheet
-        self.assertIn("Landing", names)
-        div_sheet = next(rows for name, rows in sheets if name == "Landing")
-        self.assertIn("Division", div_sheet[0])
-        self.assertIn("Library", div_sheet[0])
-        self.assertIn("Table", div_sheet[0])
+        self.assertEqual(names, ["Persistent tables", "Libraries", "Summary"])
+        rows = next(rows for name, rows in sheets if name == "Persistent tables")
+        self.assertIn("Division", rows[0])
+        self.assertIn("Library", rows[0])
+        self.assertIn("Table", rows[0])
+        # one hop from its source -> Landing, now a cell rather than a tab
+        self.assertIn("Landing", rows[1])
 
-    def test_multi_stage_flow_creates_multiple_division_sheets(self):
+    def test_multi_stage_flow_is_ordered_within_the_single_sheet(self):
         code = (
             "libname mrt 'x';\n"
             "data mrt.stg; set golden.src; a = 1; run;\n"
@@ -211,10 +210,17 @@ class TestXlsxWriter(unittest.TestCase):
         self.assertEqual(by_name["mrt.stg"], "Landing")
         self.assertEqual(by_name["mrt.mart"], "Curated")
         self.assertEqual(by_name["mrt.rep"], "Marts")
-        names = [name for name, _rows in inventory_sheets(inv)]
-        self.assertIn("All tables", names)
-        for division in divisions:
-            self.assertIn(division, names)
+        sheets = inventory_sheets(inv)
+        # Every table lives in one sheet; a division is a column value, not a
+        # tab, so sorting and filtering work across the whole pipeline.
+        self.assertEqual([name for name, _rows in sheets],
+                         ["Persistent tables", "Libraries", "Summary"])
+        rows = sheets[0][1]
+        self.assertEqual(len(rows), len(inv["tables"]) + 1)
+        # ...and the sheet still reads source -> sink.
+        div_col = rows[0].index("Division")
+        self.assertEqual([r[div_col] for r in rows[1:]],
+                         ["Landing", "Curated", "Marts"])
 
 
 if __name__ == "__main__":

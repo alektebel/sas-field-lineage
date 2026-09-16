@@ -42,6 +42,84 @@ _READ_ONLY_PROCS = {'PRINT', 'CONTENTS', 'DATASETS', 'CATALOG', 'FORMS'}
 _MAX_WARNINGS = 200
 
 
+# A dataset reference: ``[libref.]member``, where either part may still carry
+# an unexpanded ``&``/``%`` the macro pass could not resolve.
+_DS_TOKEN = r"[A-Za-z_&%][\w.&%$]*"
+_PROC_DATA_OPT_RE = re.compile(r"\bDATA\s*=\s*(" + _DS_TOKEN + r")", re.IGNORECASE)
+_PROC_OUT_OPT_RE = re.compile(r"\b(?:OUT|OUTEST|BASE)\s*=\s*(" + _DS_TOKEN + r")", re.IGNORECASE)
+# DATA-step statements whose operand is a list of datasets to read.
+_INPUT_STATEMENTS = {"SET", "MERGE", "UPDATE", "MODIFY"}
+
+
+def _skip_parens(text: str, start: int) -> int:
+    """Index just past the parenthesis group opening at ``start``.
+
+    Quoted literals are skipped whole: a parenthesis inside ``where=(x="(")``
+    is data, and counting it would unbalance the group and swallow whatever
+    dataset came after it.
+    """
+    depth = 0
+    i, n = start, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "\"'":
+            quote = ch
+            i += 1
+            while i < n and text[i] != quote:
+                i += 1
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _split_dataset_refs(text: str) -> List[str]:
+    """Split a SAS dataset list into names, keeping ``libref.member`` whole.
+
+    Handles dataset options in balanced parentheses (``(keep=a b)``,
+    ``(in=x)``, ``(where=(y>0))``), several datasets on one statement, and the
+    ``/`` that introduces step options. A bare ``keyword=`` token (``END=``,
+    ``NOBS=``, ``POINT=``) ends the list: it is an option, not a dataset.
+
+    Case is preserved and ``WORK.`` is left alone, so the name is exactly what
+    the source wrote.
+    """
+    refs: List[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n,":
+            i += 1
+            continue
+        if ch == "/":                      # step options: nothing after is a dataset
+            break
+        if ch == "(":                      # dataset options of the previous name
+            i = _skip_parens(text, i)
+            continue
+        m = re.match(_DS_TOKEN, text[i:])
+        if not m:
+            i += 1
+            continue
+        token = m.group(0)
+        j = i + m.end()
+        k = j
+        while k < n and text[k] in " \t\r\n":
+            k += 1
+        if k < n and text[k] == "=":       # an option keyword, not a dataset
+            break
+        name = token.strip().rstrip(".")
+        if name and name not in refs:
+            refs.append(name)
+        i = j
+    return refs
+
+
 class SASParser:
     """
     Parser for SAS code that extracts field lineage information
@@ -218,12 +296,14 @@ class SASParser:
         index just after its terminator (``RUN;``/``QUIT;``).
         """
         text, line = stmts[start_line]
-        # Permissive: capture ``lib.table``, ``&macro.name`` or ``%name`` too.
-        target_match = re.search(r'DATA\s+([^\s;]+)', text, re.IGNORECASE)
-        full_target = target_match.group(1) if target_match else ""
+        # Everything after DATA is a dataset list: it may name several targets
+        # and carry dataset options on each, so a single ``[^\s;]+`` token
+        # captures ``mart.res(keep=x)`` -- options and all -- as the table name.
+        targets = _split_dataset_refs(
+            re.sub(r'^\s*DATA\b', '', text, count=1, flags=re.IGNORECASE))
         # Keep the full ``lib.table`` name so the table is not mistaken for its
         # library (``lib.C111_tabla`` must not become just ``lib``).
-        output_table = full_target
+        output_table = targets[0] if targets else ""
         if not output_table and program is not None:
             self._warn(program, f"Could not read the DATA target: '{text[:80]}'",
                        line, text, kind="data-target")
@@ -257,16 +337,14 @@ class SASParser:
                     )
                 break
 
-            if upper.startswith('SET '):
-                set_match = re.search(r'SET\s+([\w.\s]+)', stmt, re.IGNORECASE)
-                if set_match:
-                    data_step.input_tables.extend(
-                        t for t in set_match.group(1).split() if t.strip())
-            elif upper.startswith('MERGE '):
-                merge_match = re.search(r'MERGE\s+([\w.\s]+)', stmt, re.IGNORECASE)
-                if merge_match:
-                    data_step.input_tables.extend(
-                        t for t in merge_match.group(1).split() if t.strip())
+            keyword = upper.split(None, 1)[0] if upper.split() else ''
+            if keyword in _INPUT_STATEMENTS:
+                # ``[\w.\s]+`` stopped at the first ``(``, so a MERGE of
+                # ``a (in=x) b (in=y)`` read only ``a`` and the second input
+                # never reached the lineage graph.
+                for t in _split_dataset_refs(stmt[len(keyword):]):
+                    if t not in data_step.input_tables:
+                        data_step.input_tables.append(t)
             elif upper.startswith('BY '):
                 by_match = re.search(r'BY\s+([\w\s]+)', stmt, re.IGNORECASE)
                 if by_match:
@@ -334,16 +412,19 @@ class SASParser:
 
         proc_step = ProcStepNode(proc_name=proc_name)
 
-        i = start_line + 1
+        # DATA=/OUT= live on the PROC statement itself, so the scan starts
+        # there: beginning at start_line + 1 left ``proc sort data=a out=b;``
+        # with no tables at all.
+        i = start_line
         terminated = False
         while i < len(stmts):
             stmt, ln = stmts[i]
             upper = stmt.upper()
-            if upper.startswith('RUN') or upper.startswith('QUIT'):
+            if i > start_line and (upper.startswith('RUN') or upper.startswith('QUIT')):
                 i += 1
                 terminated = True
                 break
-            if re.match(r'^DATA\s', upper) or re.match(r'^PROC\s', upper):
+            if i > start_line and (re.match(r'^DATA\s', upper) or re.match(r'^PROC\s', upper)):
                 if program is not None:
                     self._warn(
                         program,
@@ -354,13 +435,14 @@ class SASParser:
                     )
                 break
 
-            # Extract DATA= option (keep the full lib.table name)
-            data_match = re.search(r'DATA\s*=\s*([\w.]+)', stmt, re.IGNORECASE)
+            # DATA= / OUT= / BASE=, keeping the full lib.table name. The token
+            # pattern accepts ``&``/``%`` so a name the macro pass could not
+            # resolve is reported rather than dropped.
+            data_match = _PROC_DATA_OPT_RE.search(stmt)
             if data_match:
                 proc_step.input_table = data_match.group(1)
 
-            # Extract OUT= option (keep the full lib.table name)
-            out_match = re.search(r'OUT\s*=\s*([\w.]+)', stmt, re.IGNORECASE)
+            out_match = _PROC_OUT_OPT_RE.search(stmt)
             if out_match:
                 proc_step.output_table = out_match.group(1)
 

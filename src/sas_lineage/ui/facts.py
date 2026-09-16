@@ -251,6 +251,10 @@ class FieldFacts:
             u.add(f["to"])
         u.update(pack.get("all_downstream", []))
         u.update(pack.get("terminal_fields", []))
+        # The table owning a cited field is implied by that field, so naming it
+        # leaks nothing. Without this, a two-level table name in an answer
+        # fails the check and a correct answer is thrown away.
+        u.update({fid.rsplit(".", 1)[0] for fid in list(u) if "." in fid})
         return u
 
 

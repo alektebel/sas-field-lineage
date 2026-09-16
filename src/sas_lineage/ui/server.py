@@ -90,7 +90,12 @@ _last_code: str = ""
 _last_expand: bool = False
 _rng = random.Random(17)
 SLM_URL = os.environ.get("SLM_URL", "http://127.0.0.1:8020")
-_FIELD_TOKEN_RE = re.compile(r"[A-Za-z_]\w*\.[A-Za-z_]\w*")
+# A dotted name in a model answer. It must match the *whole* chain: now that
+# two-level table names are kept, a field id is ``libref.member.field``, and a
+# two-part pattern captures only ``libref.member`` -- a token that is never in
+# the universe, so every model answer fails the leak check and the SLM is
+# silently switched off for any program that uses librefs.
+_FIELD_TOKEN_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
 
 
 def _demo_code() -> str:

@@ -473,12 +473,17 @@ def inventory_sheets(
     inventory: Dict[str, object],
     warnings: Optional[List[Dict[str, object]]] = None,
 ) -> List[Tuple[str, List[List[object]]]]:
-    """Workbook sheets grouped by flux/division.
+    """Workbook sheets: every table in one sheet, then the supporting sheets.
 
-    The tables are **separated by the data-flow division they appear in**
-    (Golden sources -> Landing -> Curated -> Marts -> Reporting): one worksheet
-    per division, plus a combined ``All tables`` sheet when there is more than
-    one, then ``Libraries``, ``Summary`` and (optionally) ``Parser warnings``.
+    All tables share a single ``Persistent tables`` sheet with the division
+    (the data-flow stage: Golden sources -> Landing -> Curated -> Marts ->
+    Reporting) as its first column. One sheet per division looks tidy and is
+    worse to use: the question people ask is "where does this table sit and
+    what feeds it", and splitting the answer across sheets means opening every
+    one of them to sort or filter. As a column the division still groups,
+    sorts and filters -- and it does so next to the library and the inputs.
+
+    ``Libraries``, ``Summary`` and (optionally) ``Parser warnings`` follow.
     """
     tables: List[Dict[str, object]] = list(inventory.get("tables", []))  # type: ignore[arg-type]
     divisions = list(inventory.get("divisions", []))  # type: ignore[arg-type]
@@ -501,15 +506,14 @@ def inventory_sheets(
     if warnings is not None:
         summary.append(["Parser warnings", len(warnings)])
 
-    sheets: List[Tuple[str, List[List[object]]]] = []
-    if not divisions:
-        sheets.append(("Persistent tables", _rows_for_tables(tables)))
-    elif len(divisions) > 1:
-        sheets.append(("All tables", _rows_for_tables(tables)))
-    for division in divisions:
-        name = str(division.get("name", ""))
-        members = [t for t in tables if str(t.get("division", "")) == name]
-        sheets.append((name, _rows_for_tables(members)))
+    # Tables are ordered by division so the single sheet still reads
+    # source -> sink without needing one tab per stage.
+    order = {str(d.get("name", "")): i for i, d in enumerate(divisions)}
+    ordered = sorted(tables, key=lambda t: (order.get(str(t.get("division", "")), len(order)),
+                                            str(t.get("name", ""))))
+    sheets: List[Tuple[str, List[List[object]]]] = [
+        ("Persistent tables", _rows_for_tables(ordered)),
+    ]
     sheets.append(("Libraries", lib_rows))
     sheets.append(("Summary", summary))
     if warnings:

@@ -66,6 +66,42 @@ class TestSASParser(unittest.TestCase):
         self.assertEqual(program.data_steps[0].output_table, "work.contracts")
         self.assertIn("raw.contracts", program.data_steps[0].input_tables)
 
+    def test_merge_reads_every_dataset_despite_options(self):
+        # ``[\w.\s]+`` stopped at the first "(", so the second input never
+        # reached the graph.
+        code = "DATA m; MERGE a.one (IN=i1) a.two (IN=i2); BY k; x = 1; RUN;"
+        step = self.parser.parse(code).data_steps[0]
+        self.assertEqual(step.input_tables, ["a.one", "a.two"])
+
+    def test_dataset_options_are_not_part_of_the_target_name(self):
+        code = "DATA mrt.res(keep=x y); SET raw.src(where=(x>0)); x = 1; RUN;"
+        step = self.parser.parse(code).data_steps[0]
+        self.assertEqual(step.output_table, "mrt.res")
+        self.assertEqual(step.input_tables, ["raw.src"])
+
+    def test_set_options_are_not_table_names(self):
+        code = "DATA t; SET src END=eof NOBS=n; x = 1; RUN;"
+        self.assertEqual(self.parser.parse(code).data_steps[0].input_tables, ["src"])
+
+    def test_parenthesis_inside_a_literal_does_not_swallow_the_next_dataset(self):
+        code = 'DATA t; SET a(where=(x="(")) b; v = 1; RUN;'
+        self.assertEqual(self.parser.parse(code).data_steps[0].input_tables, ["a", "b"])
+
+    def test_proc_statement_options_are_read(self):
+        # data=/out= sit on the PROC line; the scan used to start after it.
+        step = self.parser.parse("PROC SORT DATA=lib.a OUT=lib.b NODUPKEY; BY k; RUN;").proc_steps[0]
+        self.assertEqual(step.input_table, "lib.a")
+        self.assertEqual(step.output_table, "lib.b")
+
+    def test_proc_append_base_is_the_output(self):
+        step = self.parser.parse("PROC APPEND BASE=hist.all DATA=stg.new; RUN;").proc_steps[0]
+        self.assertEqual(step.output_table, "hist.all")
+        self.assertEqual(step.input_table, "stg.new")
+
+    def test_proc_option_keeps_an_unresolved_macro_name(self):
+        step = self.parser.parse("PROC SORT DATA=&lib..a OUT=&lib..b; BY k; RUN;").proc_steps[0]
+        self.assertEqual(step.input_table, "&lib..a")
+
     def test_multiple_data_steps(self):
         """Test parsing multiple DATA steps"""
         sas_code = """
