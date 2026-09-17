@@ -131,6 +131,28 @@ class TestMacroPreprocessor(unittest.TestCase):
         prog = self.parser.parse(code, expand_macros=True)
         self.assertEqual([d.output_table for d in prog.data_steps], ["d_runtime"])
 
+    def test_expansion_is_idempotent_and_complete(self):
+        from src.sas_lineage.parser.preprocessor import expand_audited
+        code = ("%let p = LIBNAME.C111;\n%macro b(l); data &l..&p._t; set s; run; "
+                "%mend;\n%b(mrt)\n")
+        once, first = expand_audited(code)
+        twice, second = expand_audited(once)
+        self.assertTrue(first["complete"])
+        self.assertTrue(second["complete"])
+        self.assertEqual(once, twice)
+
+    def test_substitution_covers_generated_cases(self):
+        from src.sas_lineage.parser.preprocessor import expand_audited
+        cases = [("mrt", "A", 1), ("mrt", "B", 2), ("LIBNAME.C111", "X", 3), ("WORKLIB", "Y", 0)]
+        for lib, prefix, count in cases:
+            code = (f"%let lib = {lib};\n%let pre = {prefix};\n%let n = {count};\n"
+                    "%macro go;\n%do i = 1 %to &n;\n"
+                    "data &lib..&pre._t&i; set s&i; run;\n%end;\n%mend;\n%go\n")
+            out, audit = expand_audited(code)
+            self.assertTrue(audit["complete"], f"{lib}/{prefix}/{count}: {audit['residual_refs']}")
+            for i in range(1, count + 1):
+                self.assertIn(f"data {lib}.{prefix}_t{i};", out)
+
     def test_include_is_opt_in_and_sandboxed(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)

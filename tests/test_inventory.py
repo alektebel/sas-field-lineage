@@ -115,6 +115,33 @@ class TestInventory(unittest.TestCase):
         names, _ = self._names(code)
         self.assertEqual(names, {"mrt.t"})
 
+    def test_audit_is_complete_for_resolvable_macros(self):
+        code = ("%let p = LIBNAME.C111;\n"
+                "%macro b(l); data &l..&p._t; set s; run; %mend;\n"
+                "%b(mrt)\n")
+        inv = build_inventory(code)
+        self.assertTrue(inv["audit"]["complete"])
+        self.assertIn("b", inv["audit"]["macros_defined"])
+        self.assertIn("p", inv["audit"]["symbols_defined"])
+        self.assertEqual(inv["audit"]["residual_refs"], [])
+
+    def test_audit_flags_unresolved_reference(self):
+        inv = build_inventory("data &missinglib.t; set s; run;\n")
+        self.assertFalse(inv["audit"]["complete"])
+        self.assertIn("&missinglib", inv["audit"]["residual_refs"])
+
+    def test_assurance_classifies_manifest_tables(self):
+        from src.sas_lineage.report import assurance, parsed_outputs
+        code = ("%let p = LIBNAME.C111;\n"
+                "data work.tmp; set s; x = 1; run;\n"
+                "data &p._out; set work.tmp; y = 1; run;\n")
+        inv = build_inventory(code)
+        report = assurance(inv, ["tmp", "C111_out", "never_made"], parsed_outputs(code))
+        self.assertTrue(report["substitution_complete"])
+        self.assertIn("C111_out", report["matched"])
+        self.assertIn("tmp", report["parsed_not_persistent"])
+        self.assertIn("never_made", report["missing"])
+
     def test_expand_disabled_keeps_raw_names(self):
         code = "%let p = clm;\ndata mrt.&p._1; set x; run;\n"
         inv = build_inventory(code, expand=False)

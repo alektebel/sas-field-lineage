@@ -65,6 +65,15 @@ class TestEgpExtraction(unittest.TestCase):
         self.assertIn("data mrt.t", source)
         self.assertGreater(info["chars"], 0)
 
+    def test_zip_manifest_tables_are_read_as_oracle(self):
+        data = _make_zip({
+            "manifest.json": json.dumps({"name": "p", "tables_produced": ["t1", "t2"]}),
+            "programs/src.sas": "data lib.t1; set s; run;\n",
+        })
+        source, info = extract_sas(data)
+        self.assertEqual(info["manifest_tables"], ["t1", "t2"])
+        self.assertEqual(info["manifest_name"], "p")
+
     def test_zip_programs_keep_archive_order_for_cross_file_macros(self):
         use = "%mk(mrt)\n"
         definition = "%macro mk(lib);\ndata &lib..t; set src; run;\n%mend;\n"

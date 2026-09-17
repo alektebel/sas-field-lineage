@@ -16,6 +16,7 @@ leak into the parsed program.
 from __future__ import annotations
 
 import io
+import json
 import re
 import struct
 import zipfile
@@ -206,23 +207,48 @@ def _read_ole_streams(data: bytes) -> List[Tuple[str, bytes]]:
 # --------------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------------- #
+def _read_manifest(archive: "zipfile.ZipFile", names: List[str]) -> Dict[str, object]:
+    """Read an EGP ``manifest.json`` (when present) as a completeness oracle."""
+    for name in names:
+        if name.rsplit("/", 1)[-1].lower() != "manifest.json":
+            continue
+        try:
+            data = json.loads(_decode(archive.read(name)))
+        except (ValueError, KeyError, OSError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        tables = data.get("tables_produced") or []
+        layers = []
+        for layer in data.get("layers") or []:
+            if isinstance(layer, dict):
+                layers.append({"id": layer.get("id"), "name": layer.get("name")})
+        return {
+            "manifest_name": data.get("name"),
+            "manifest_tables": [str(t) for t in tables if t],
+            "manifest_layers": layers,
+        }
+    return {}
+
+
 def _from_zip(data: bytes) -> Tuple[str, Dict[str, object]] | None:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             names = archive.namelist()
+            manifest = _read_manifest(archive, names)
             # Keep the archive (start-to-finish) order: an EGP's programs may
             # define a macro in one program and use it in a later one.
             sas_names = [n for n in names if n.lower().endswith(".sas")]
             if sas_names:
                 parts = [_decode(archive.read(n)) for n in sas_names]
                 source = "\n\n".join(p for p in parts if p.strip())
-                return source, {"format": "zip", "programs": sas_names}
+                return source, {"format": "zip", "programs": sas_names, **manifest}
             parts = []
             for name in names:
                 block = _collect_sas_from_text(_decode(archive.read(name)))
                 if block:
                     parts.append(block)
-            return "\n\n".join(parts), {"format": "zip", "programs": []}
+            return "\n\n".join(parts), {"format": "zip", "programs": [], **manifest}
     except (zipfile.BadZipFile, OSError):
         return None
 

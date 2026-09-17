@@ -14,6 +14,7 @@ A Python application for tracking field-level data lineage in SAS code. This too
 - **🗣️ Plain-English field explainer (SLM)**: "Explain construction", "What happens downstream?" and "Affected by it?" buttons on any field, answered by the fine-tuned 0.5B lineage SLM (`../sas-reconcile-slm`) — with a deterministic-engine fallback and a packet leak guard, so the feature never invents fields and never depends on the model being up
 - **📄 Persistent-library table report**: download an Excel workbook of every table written to a persistent (non-`WORK`) SAS library — with `LIBNAME` paths/engines and the writing step (DATA, `PROC SQL CREATE TABLE/VIEW`, `OUT=`/`BASE=`) — resolving `%let`/`&macro` names, prefixes and `%do` loops first, and flagging any name it could not resolve. Tables are **separated by the flux/division they appear in** (Golden sources → Landing → Curated → Marts → Reporting), one worksheet per division, derived from the program's own data flow
 - **⚠️ Parse warnings & coverage**: statements the parser cannot fully model are reported instead of silently dropped, but the noise is kept low — unsupported DATA-step statements are aggregated to one warning per step, and declarative statements (`LENGTH`, `FORMAT`, `LABEL`, `RETURN`, …) and read-only procs (`PROC PRINT`/`CONTENTS`/`DATASETS`) are skipped silently. A **parse-coverage** indicator (`NN% of statements parsed`) shows how much of the EGP was understood. Warnings appear in the explorer header, print to the CLI (stderr) and become the report's `Parser warnings` sheet
+- **✅ Assurance — no silent drops**: every run reports a substitution audit (macros defined, `%let` symbols, macro invocations, and every `&`/`%` reference left unresolved) so you can prove nothing was dropped; on top of that, an uploaded `.egp`'s own `manifest.json` `tables_produced` list is used as an oracle and each expected table is classified **matched / parsed-but-WORK / missing**. Both appear as a green/red badge in the explorer and an **Assurance** sheet in the workbook
 - **📁 Data Import**: Read input data from Excel (.xlsx, .xls) and CSV files
 
 ## Installation
@@ -85,8 +86,8 @@ What the explorer gives you:
    names, prefixes and `%do` loops are resolved before reporting; anything still
    unresolved is kept as a flagged row instead of being dropped. The workbook
    also has an **All tables** sheet (when there are several divisions),
-   **Libraries** and **Summary** sheets. The download shows its own progress
-   bar (collect → resolve → write).
+   **Libraries**, **Summary** and **Assurance** sheets. The download shows its
+   own progress bar (collect → resolve → write).
 6. **Parse warnings & coverage** — a `⚠ n parser warnings` indicator plus a
    `NN% of statements parsed` coverage readout appear after loading a program.
    Unsupported DATA-step statements are summarised once per step, read-only

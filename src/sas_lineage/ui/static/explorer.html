@@ -153,6 +153,9 @@
     <sc-if value="{{ coverageLabel }}" hint-placeholder-val="{{ '' }}">
       <span style="color:#5c5c5c;white-space:nowrap" title="Share of statements attributed to a DATA/PROC step; ignored statements still appear in the report warnings">{{ coverageLabel }}</span>
     </sc-if>
+    <sc-if value="{{ assuranceLabel }}" hint-placeholder-val="{{ '' }}">
+      <span style="color:{{ assuranceFg }};white-space:nowrap;cursor:help" title="{{ assuranceTip }}">{{ assuranceLabel }}</span>
+    </sc-if>
     <span style="margin-left:auto;white-space:nowrap">Double-click a field to run values through the graph · ⌘/Ctrl + scroll to zoom</span>
   </div>
 
@@ -478,7 +481,7 @@ class Component extends DCLogic {
     tablesNote:'', warnings:[], progress:null, flowsOpen:false,
     fileNote:'No workbook loaded — using stored sample values.' };
   mainRef = React.createRef();
-  N = []; E = []; F = []; LAYERS = []; _regOrder = []; _stats = {};
+  N = []; E = []; F = []; LAYERS = []; _regOrder = []; _stats = {}; _assurance = null; _substitution = null;
 
   componentDidMount() {
     const measure = () => { const el = this.mainRef.current; if (el) this.setState({ avail: el.clientWidth, win: window.innerWidth }); };
@@ -539,6 +542,8 @@ class Component extends DCLogic {
     this.N = p.N || []; this.E = p.E || []; this.F = p.F || []; this.LAYERS = p.LAYERS || [];
     this._regOrder = p.registers || [];
     this._stats = p.stats || {};
+    this._assurance = p.assurance || null;
+    this._substitution = p.substitution || null;
     const selNode = (this.N.find(n => n.golden) && this.N.find(n => n.golden).id) || (this.N[0] && this.N[0].id) || null;
     this.setState({ node: selNode, field:this.F[0] ? this.F[0].id : null, mode:'node', run:null, vals:{}, q:'',
       warnings: p.warnings || [],
@@ -903,6 +908,30 @@ class Component extends DCLogic {
       };
     });
 
+    // Assurance: did macro substitution complete, and does the EGP manifest agree?
+    const assur = (() => {
+      const a = this._assurance, s = this._substitution;
+      if (a && a.manifest_checked) {
+        const missing = (a.missing || []).length, unresolved = (a.unresolved || []).length;
+        const ok = a.substitution_complete && missing === 0;
+        return {
+          label: (ok ? '✓ ' : '⚠ ') + 'substitution ' + (a.substitution_complete ? 'complete' : unresolved + ' unresolved') +
+                 ' · manifest ' + (a.matched || []).length + '/' + a.expected + (missing ? ' (' + missing + ' missing)' : ''),
+          fg: ok ? '#1a7f37' : '#e0301e',
+          tip: 'Expected ' + a.expected + ' · matched ' + (a.matched || []).length +
+               ' · parsed (WORK-only) ' + (a.parsed_not_persistent || []).length +
+               ' · missing ' + missing + ' · not in manifest ' + (a.extra || []).length +
+               (unresolved ? '\nUnresolved: ' + (a.unresolved || []).join(', ') : ''),
+        };
+      }
+      if (s && s.complete != null) {
+        const u = s.residual_refs || [];
+        return { label: (s.complete ? '✓ substitution complete' : '⚠ ' + u.length + ' unresolved reference(s)'),
+                 fg: s.complete ? '#1a7f37' : '#e0301e', tip: u.join('\n') };
+      }
+      return { label:'', fg:'#8a8480', tip:'' };
+    })();
+
     const dd = [{ v:1, label:'1' }, { v:2, label:'2' }, { v:3, label:'3' }, { v:0, label:'All' }].map(d => ({
       label:d.label, bg: depth === d.v ? P.ink : '#fff', fg: depth === d.v ? '#fff' : P.ink,
       border: depth === d.v ? P.ink : '#cfcac5', onClick: () => this.setState({ depth:d.v }) }));
@@ -990,6 +1019,7 @@ class Component extends DCLogic {
       progressPct: this.state.progress ? this.state.progress.pct : 0,
       progressLabel: this.state.progress ? this.state.progress.label : '',
       coverageLabel: (this._stats.coverage != null ? (this._stats.coverage + '% of statements parsed' + (this._stats.ignored ? ' · ' + this._stats.ignored + ' ignored' : '')) : ''),
+      assuranceLabel: assur.label, assuranceFg: assur.fg, assuranceTip: assur.tip,
       flowsOpen: this.state.flowsOpen, flows: flows,
       toggleFlows: () => this.setState({ flowsOpen: !this.state.flowsOpen }),
       flowsBtnBg: this.state.flowsOpen ? '#ece9e6' : '#fff',

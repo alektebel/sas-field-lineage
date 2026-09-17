@@ -253,7 +253,8 @@ def _eval_cond(expr: str, resolve) -> bool:
 
 class MacroPreprocessor:
     def __init__(self, include_base: Optional[str] = None, preserve_unknown: bool = False,
-                 topological: bool = True):
+                 topological: bool = True, audit: bool = False,
+                 preserve_unresolved: bool = False):
         self.macros: Dict[str, Dict] = {}
         self.symbols: Dict[str, str] = {}
         self.include_base = include_base
@@ -266,7 +267,21 @@ class MacroPreprocessor:
         # a macro or prefix used before its definition -- common across the
         # programs of one EGP -- is still expanded.
         self.topological = topological
+        # Assurance mode: count what resolved and keep unknown macro calls as
+        # literal text so nothing is dropped silently.
+        self.audit = audit
+        self.preserve_unresolved = preserve_unresolved
+        self.audit_data: Dict[str, object] = {
+            "macro_invocations": 0,
+            "macro_invocations_unresolved": [],
+            "truncated": False,
+        }
         self._include_seen: set = set()
+
+    def _record_unresolved(self, name: str) -> None:
+        bucket = self.audit_data["macro_invocations_unresolved"]
+        if isinstance(bucket, list) and len(bucket) < 200 and name not in bucket:
+            bucket.append(name)
 
     # ------------------------------------------------------------------ #
     def preprocess(self, code: str, include_base: Optional[str] = None) -> str:
@@ -440,6 +455,7 @@ class MacroPreprocessor:
     # ---- main expander ------------------------------------------------- #
     def _expand(self, text: str, scope: Dict[str, str], depth: int) -> str:
         if depth > _MAX_DEPTH:
+            self.audit_data["truncated"] = True
             return text
         out = []
         i = 0
@@ -447,6 +463,7 @@ class MacroPreprocessor:
         while i < len(text):
             iters += 1
             if iters > _MAX_ITERS:
+                self.audit_data["truncated"] = True
                 return "".join(out) + text[i:]
             ch = text[i]
             if ch == "%":
@@ -765,7 +782,11 @@ class MacroPreprocessor:
 
     # ---- macro invocation / functions ------------------------------------ #
     def _invoke(self, name: str, args_text: str, scope, depth) -> str:
+        self.audit_data["macro_invocations"] = int(self.audit_data["macro_invocations"]) + 1
         if name not in self.macros:
+            self._record_unresolved(name)
+            if self.preserve_unresolved:
+                return f"%{name}({args_text})" if args_text else f"%{name}"
             return ""
         macro = self.macros[name]
         args_list = _split_commas(args_text) if args_text else []
@@ -1027,6 +1048,42 @@ def expand_for_report(code: str, include_base: Optional[str] = None) -> str:
             return linear_expand(code)
         except Exception:
             return code
+
+
+_RESIDUAL_RE = re.compile(r"[&%][A-Za-z_]\w*")
+
+
+def expand_audited(code: str, include_base: Optional[str] = None) -> Tuple[str, Dict[str, object]]:
+    """Expand ``code`` and return ``(expanded, audit)``.
+
+    The audit is the basis of the assurance guarantee: it lists every macro
+    definition and symbol found, how many macro invocations resolved, which
+    macro calls could *not* be resolved, and every ``&name``/``%name`` left in
+    the output. ``audit["complete"]`` is True only when the expander can point
+    to a resolution for every reference — i.e. nothing was silently dropped.
+    """
+    proc = MacroPreprocessor(
+        include_base, preserve_unknown=True, topological=True,
+        audit=True, preserve_unresolved=True,
+    )
+    try:
+        out = proc.preprocess(code)
+    except Exception as exc:  # pragma: no cover - defensive
+        out = code
+        proc.audit_data["error"] = str(exc)
+
+    residual = sorted(set(_RESIDUAL_RE.findall(out)))
+    audit: Dict[str, object] = dict(proc.audit_data)
+    audit["macros_defined"] = sorted(proc.macros)
+    audit["symbols_defined"] = sorted(proc.symbols)
+    audit["residual_refs"] = residual[:200]
+    audit["residual_count"] = len(residual)
+    audit["complete"] = (
+        not residual
+        and not audit.get("truncated")
+        and not audit.get("error")
+    )
+    return out, audit
 
 
 def preprocess(code: str, include_base: Optional[str] = None) -> str:

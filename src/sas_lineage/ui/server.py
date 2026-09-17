@@ -48,8 +48,8 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from ..parser import SASParser, extract_sas
-from ..parser.preprocessor import expand_for_report
-from ..report import build_inventory, inventory_sheets, write_xlsx
+from ..parser.preprocessor import expand_audited, expand_for_report
+from ..report import assurance, build_inventory, inventory_sheets, parsed_outputs, write_xlsx
 from .facts import FieldFacts, SYSTEM_PROMPT, make_question, user_message
 from .payload import build_payload, ProgramIndex
 from .trace import run_field_trace
@@ -88,6 +88,7 @@ _index: ProgramIndex | None = None
 _facts: Optional[FieldFacts] = None
 _last_code: str = ""
 _last_expand: bool = False
+_last_manifest: Optional[list] = None
 _rng = random.Random(17)
 SLM_URL = os.environ.get("SLM_URL", "http://127.0.0.1:8020")
 # A dotted name in a model answer. It must match the *whole* chain: now that
@@ -116,11 +117,18 @@ def _parse(code: str, expand_macros: bool = False) -> Dict[str, Any]:
         _program = SASParser().parse(code, expand_macros=expand_macros)
         _index = ProgramIndex(_program)
         _facts = FieldFacts(_program)
-        return build_payload(_program)
+        payload = build_payload(_program)
+    try:
+        _, audit = expand_audited(code)
+        payload["substitution"] = audit
+    except Exception:  # pragma: no cover - defensive
+        payload["substitution"] = {"complete": None, "residual_refs": []}
+    return payload
 
 
 def _import(filename: str, content_b64: str, expand_macros: bool = False) -> Dict[str, Any]:
     """Extract SAS from an uploaded .egp/archive and parse it for lineage."""
+    global _last_manifest
     try:
         data = base64.b64decode(content_b64, validate=False)
     except (binascii.Error, ValueError) as exc:
@@ -128,9 +136,15 @@ def _import(filename: str, content_b64: str, expand_macros: bool = False) -> Dic
     source, info = extract_sas(data)
     info = dict(info)
     info["filename"] = filename
+    with _lock:
+        _last_manifest = info.get("manifest_tables") or None
     payload = _parse(source, expand_macros)
+    inventory = build_inventory(source)
     payload["source"] = source
     payload["import"] = info
+    payload["assurance"] = assurance(
+        inventory, info.get("manifest_tables"), parsed_outputs(source))
+    payload["substitution"] = inventory.get("audit", {})
     if not source.strip():
         payload.setdefault("warnings", []).insert(0, {
             "message": f"No SAS code found in '{filename or 'upload'}' "
@@ -150,17 +164,23 @@ def _parse_warnings(code: str) -> list:
 
 def _tables(code: str) -> Dict[str, Any]:
     """Persistent-library table inventory for ``code`` (macros always resolved)."""
+    with _lock:
+        manifest = _last_manifest
     inventory = build_inventory(code)
     inventory["warnings"] = _parse_warnings(code)
+    inventory["assurance"] = assurance(inventory, manifest, parsed_outputs(code))
     return inventory
 
 
 def _tables_xlsx(code: str) -> bytes:
+    with _lock:
+        manifest = _last_manifest
     inventory = build_inventory(code)
     warnings = _parse_warnings(code)
     inventory["warnings"] = warnings
+    inventory["assurance"] = assurance(inventory, manifest, parsed_outputs(code))
     buf = io.BytesIO()
-    write_xlsx(buf, inventory_sheets(inventory, warnings))
+    write_xlsx(buf, inventory_sheets(inventory, warnings, manifest))
     return buf.getvalue()
 
 

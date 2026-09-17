@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from ..parser.preprocessor import expand_for_report
+from ..parser.preprocessor import expand_audited
 from ..parser.sas_parser import SASParser
 
 __all__ = [
@@ -33,6 +33,7 @@ __all__ = [
     "build_inventory",
     "inventory_rows",
     "inventory_sheets",
+    "assurance",
 ]
 
 _LIBNAME_RE = re.compile(r"^LIBNAME\s+([A-Za-z_]\w*)\s*(.*)$", re.IGNORECASE | re.DOTALL)
@@ -389,7 +390,16 @@ def build_inventory(
     to inspect raw names.
     """
     raw_lower = _WS_RE.sub(" ", code).lower()
-    expanded = expand_for_report(code, include_base) if expand else code
+    if expand:
+        expanded, audit = expand_audited(code, include_base)
+    else:
+        expanded = code
+        audit = {
+            "complete": False, "residual_refs": [], "residual_count": 0,
+            "macros_defined": [], "symbols_defined": [],
+            "macro_invocations": 0, "macro_invocations_unresolved": [],
+            "truncated": False,
+        }
     statements = _tokenize(expanded)
 
     libraries: Dict[str, LibraryRef] = {}
@@ -426,7 +436,79 @@ def build_inventory(
                                                        key=lambda r: r.libref.lower())],
         "tables": [row.to_dict() for row in tables],
         "divisions": divisions,
+        "audit": audit,
         "stats": stats,
+    }
+
+
+def _bare(name: str) -> str:
+    return name.rsplit(".", 1)[-1].lower()
+
+
+def parsed_outputs(code: str, expand: bool = True) -> List[str]:
+    """Every dataset the parser saw being written (persistent *and* WORK)."""
+    source = expand_audited(code)[0] if expand else code
+    program = SASParser().parse(source)
+    outputs = [ds.output_table for ds in program.data_steps if ds.output_table]
+    outputs += [ps.output_table for ps in program.proc_steps if ps.output_table]
+    return outputs
+
+
+def assurance(inventory: Dict[str, object],
+              manifest_tables: Optional[List[str]] = None,
+              parsed_tables: Optional[List[str]] = None) -> Dict[str, object]:
+    """Reconcile the report against the substitution audit and an EGP manifest.
+
+    ``substitution_complete`` is True only when the expander resolved every
+    macro call and every ``&``/``%`` reference — i.e. nothing was dropped
+    silently. When ``manifest_tables`` (the ``tables_produced`` list from an
+    EGP ``manifest.json``) is supplied, each expected table is classified as:
+
+    * ``matched`` — present in the persistent-library report,
+    * ``parsed_not_persistent`` — the parser saw it, but it lands in ``WORK``,
+    * ``missing`` — never seen at all (a genuine gap).
+
+    Matching is by bare table name because the manifest lists names without a
+    library while the report keeps ``lib.table``.
+    """
+    persistent: Dict[str, str] = {}
+    for table in inventory.get("tables", []):  # type: ignore[union-attr]
+        persistent.setdefault(_bare(str(table.get("table", ""))), str(table.get("name", "")))
+
+    seen = set(persistent)
+    for name in (parsed_tables or []):
+        seen.add(_bare(str(name)))
+
+    expected = [str(t) for t in (manifest_tables or [])]
+    expected_lower = {t.lower() for t in expected}
+    matched: List[str] = []
+    parsed_only: List[str] = []
+    missing: List[str] = []
+    for name in expected:
+        key = name.lower()
+        if key in persistent:
+            matched.append(name)
+        elif key in seen:
+            parsed_only.append(name)
+        else:
+            missing.append(name)
+    extra = [name for key, name in persistent.items() if key not in expected_lower]
+
+    audit = inventory.get("audit", {}) or {}
+    return {
+        "substitution_complete": bool(audit.get("complete", True)),
+        "unresolved": list(audit.get("residual_refs", [])),
+        "macros_defined": len(audit.get("macros_defined", [])),
+        "symbols_defined": len(audit.get("symbols_defined", [])),
+        "macro_invocations": audit.get("macro_invocations", 0),
+        "manifest_checked": bool(expected),
+        "matched": matched,
+        "parsed_not_persistent": parsed_only,
+        "missing": missing,
+        "extra": extra,
+        "reported": len(persistent),
+        "expected": len(expected),
+        "accounted": len(matched) + len(parsed_only),
     }
 
 
@@ -463,6 +545,30 @@ def inventory_rows(inventory: Dict[str, object]) -> List[List[object]]:
     return rows
 
 
+def _assurance_rows(inventory: Dict[str, object],
+                    manifest_tables: Optional[List[str]] = None) -> List[List[object]]:
+    info = assurance(inventory, manifest_tables)
+    rows: List[List[object]] = [["Check", "Result", "Detail"]]
+    rows.append([
+        "Macro substitution complete",
+        "Yes" if info["substitution_complete"] else "No",
+        ", ".join(info["unresolved"]) or "all references resolved",
+    ])
+    rows.append(["Macros defined", info["macros_defined"], ""])
+    rows.append(["Symbols (%let) defined", info["symbols_defined"], ""])
+    rows.append(["Macro invocations", info["macro_invocations"], ""])
+    if info["manifest_checked"]:
+        rows.append(["Manifest tables expected", info["expected"], ""])
+        rows.append(["Matched (persistent)", len(info["matched"]), ", ".join(info["matched"])])
+        rows.append(["Parsed but not persistent (WORK)", len(info["parsed_not_persistent"]),
+                     ", ".join(info["parsed_not_persistent"])])
+        rows.append(["Missing (not parsed)", len(info["missing"]), ", ".join(info["missing"])])
+        rows.append(["Not in manifest", len(info["extra"]), ", ".join(info["extra"])])
+    else:
+        rows.append(["Manifest tables expected", 0, "no manifest in source"])
+    return rows
+
+
 def _rows_for_tables(tables: List[Dict[str, object]]) -> List[List[object]]:
     return [[label for _key, label in _TABLE_COLUMNS]] + [
         [_cell(table.get(key)) for key, _label in _TABLE_COLUMNS] for table in tables
@@ -472,6 +578,7 @@ def _rows_for_tables(tables: List[Dict[str, object]]) -> List[List[object]]:
 def inventory_sheets(
     inventory: Dict[str, object],
     warnings: Optional[List[Dict[str, object]]] = None,
+    manifest_tables: Optional[List[str]] = None,
 ) -> List[Tuple[str, List[List[object]]]]:
     """Workbook sheets: every table in one sheet, then the supporting sheets.
 
@@ -516,6 +623,7 @@ def inventory_sheets(
     ]
     sheets.append(("Libraries", lib_rows))
     sheets.append(("Summary", summary))
+    sheets.append(("Assurance", _assurance_rows(inventory, manifest_tables)))
     if warnings:
         warn_rows: List[List[object]] = [["Kind", "Line", "Message", "Statement"]]
         for w in warnings:
