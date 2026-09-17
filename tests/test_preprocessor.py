@@ -168,6 +168,41 @@ class TestMacroPreprocessor(unittest.TestCase):
             self.assertEqual(prog.data_steps, [])
 
 
+    def test_percent_inside_single_quotes_is_not_a_macro(self):
+        from src.sas_lineage.parser.preprocessor import expand_audited
+        code = ("data mrt.k; set s;\n"
+                "  where note like '%DIRECTOR%' and info like '%RETIRE%';\nrun;\n")
+        out, audit = expand_audited(code)
+        self.assertTrue(audit["complete"])
+        self.assertIn("%DIRECTOR%", out)
+        self.assertTrue(any("%DIRECTOR" in t for t in audit["string_literals"]))
+
+    def test_put_with_embedded_if_does_not_leak(self):
+        from src.sas_lineage.parser.preprocessor import expand_audited
+        code = ("%let fail = 0;\n"
+                "%put status: %if &fail > 0 %then %do; BAD %end; %else %do; OK %end;;\n"
+                "data mrt.after; set s; x = 1; run;\n")
+        out, audit = expand_audited(code)
+        self.assertIn("data mrt.after", out)
+        self.assertNotIn("%ELSE", out.upper())
+        self.assertTrue(audit["complete"])
+
+    def test_local_declarations_and_noop_statements_are_consumed(self):
+        from src.sas_lineage.parser.preprocessor import expand_audited
+        code = ("%macro m;\n%local a b;\n%let a = 1;\n%if &a = 1 %then %return;\n%mend;\n"
+                "%m\n%stop;\n%leave;\n%continue;\n")
+        out, audit = expand_audited(code)
+        self.assertTrue(audit["complete"], audit["residual_refs"])
+        self.assertNotIn("%local", out.lower())
+
+    def test_automatic_macro_variables_resolve(self):
+        from src.sas_lineage.parser.preprocessor import expand_audited
+        code = ("%if &sqlrc > 0 %then %do; %put failed; %end;\n"
+                "%put &sysdate &systime;\ndata mrt.ok; set s; run;\n")
+        out, audit = expand_audited(code)
+        self.assertTrue(audit["complete"])
+        self.assertIn("data mrt.ok", out)
+
     def test_literal_call_symput_defines_the_symbol(self):
         # SAS only creates it when the DATA step runs; without seeding it the
         # library name below never resolves.

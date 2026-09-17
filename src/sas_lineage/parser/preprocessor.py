@@ -55,11 +55,30 @@ _ARITH_OPS = {
 _MAX_DEPTH = 40
 _MAX_ITERS = 40000
 
+# SAS automatic macro variables. They are not ``%let`` in the source, so
+# without a value every ``&SQLRC``/``&SYSDATE`` shows up as "unresolved" even
+# though SAS always defines them. Seed representative values so conditions and
+# names resolve deterministically; a user ``%let`` of the same name wins.
+_AUTOMATIC_SYMBOLS = {
+    "sysdate": "01JAN2026", "sysdate9": "01JAN2026", "systime": "00:00",
+    "sysday": "01", "sysmonth": "1", "sysyear": "2026", "sysscp": "LINUX",
+    "sysver": "9.4", "sysvlong": "9.04.01M7", "sysmacroname": "",
+    "sysprocessid": "0", "sysjobid": "0", "syshostname": "localhost",
+    "sysuserid": "", "sysworkdir": "", "syslib": "", "sysenv": "",
+    "sqlobs": "0", "sqlrc": "0", "sqloops": "0", "_iorc_": "0",
+    "_error_": "0", "_n_": "1",
+}
+
 
 def _strip_macro_comments(text: str) -> str:
     text = re.sub(r"%\*.*?;", " ", text, flags=re.DOTALL)          # %* ... ;
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)        # /* ... */
     return text
+
+
+def _is_func(name: str) -> bool:
+    """True for a macro function, including the ``%q...`` quoting variants."""
+    return name in _FUNCS or (name.startswith("q") and name[1:] in _FUNCS)
 
 
 def _balanced(text: str, open_idx: int) -> Tuple[str, int]:
@@ -85,7 +104,7 @@ def _find_top(text: str, start: int, targets: List[str]) -> Tuple[int, str]:
                 j = i + m.end()
                 while j < len(text) and text[j] == " ":
                     j += 1
-                if kw in _FUNCS and j < len(text) and text[j] == "(":
+                if _is_func(kw) and j < len(text) and text[j] == "(":
                     _, j = _balanced(text, j)
                     i = j
                     continue
@@ -256,7 +275,7 @@ class MacroPreprocessor:
                  topological: bool = True, audit: bool = False,
                  preserve_unresolved: bool = False):
         self.macros: Dict[str, Dict] = {}
-        self.symbols: Dict[str, str] = {}
+        self.symbols: Dict[str, str] = dict(_AUTOMATIC_SYMBOLS)
         self.include_base = include_base
         # When True, ``&name`` references with no matching %let are kept as-is
         # instead of collapsing to an empty string. Used by the persistent-
@@ -274,6 +293,7 @@ class MacroPreprocessor:
         self.audit_data: Dict[str, object] = {
             "macro_invocations": 0,
             "macro_invocations_unresolved": [],
+            "runtime_symbols": [],
             "truncated": False,
         }
         self._include_seen: set = set()
@@ -381,7 +401,8 @@ class MacroPreprocessor:
                 value = self._expand(latest[name], dict(self.symbols), depth=0)
             except Exception:
                 value = latest[name]
-            self.symbols.setdefault(name, value)
+            # A user %let overrides any seeded automatic variable.
+            self.symbols[name] = value
             visiting.discard(name)
             done.add(name)
 
@@ -460,12 +481,33 @@ class MacroPreprocessor:
         out = []
         i = 0
         iters = 0
+        # The guard must scale with the input: ``_expand`` walks the text one
+        # character at a time, so a fixed cap silently abandoned the tail of
+        # every file larger than the cap (leaving ``%if``/``&sym`` unexpanded).
+        limit = max(_MAX_ITERS, len(text) + 1000)
+        quote = None
         while i < len(text):
             iters += 1
-            if iters > _MAX_ITERS:
+            if iters > limit:
                 self.audit_data["truncated"] = True
                 return "".join(out) + text[i:]
             ch = text[i]
+            # Macro triggers are not recognised inside string literals: a single
+            # quote masks ``%`` and ``&`` entirely; a double quote still resolves
+            # ``&`` but not ``%`` (e.g. ``'%DIRECTOR%'`` is a LIKE pattern).
+            if quote:
+                if ch == quote:
+                    quote = None
+                elif quote == "'":
+                    out.append(ch)  # single quotes mask % and &
+                    i += 1
+                    continue
+                # Double quotes still resolve & and % (fall through).
+            elif ch in ("'", '"'):
+                quote = ch
+                out.append(ch)
+                i += 1
+                continue
             if ch == "%":
                 m = re.match(r"%([A-Za-z_]\w*)", text[i:])
                 if not m:
@@ -502,8 +544,8 @@ class MacroPreprocessor:
                     i = len(text) if sem == -1 else sem + 1
                     continue
                 if name == "let":
-                    sem = text.find(";", j)
-                    if sem == -1:
+                    sem = self._statement_end(text, j)
+                    if sem >= len(text):
                         out.append(text[i:])
                         break
                     stmt = text[j:sem]
@@ -514,16 +556,28 @@ class MacroPreprocessor:
                     i = sem + 1
                     continue
                 if name == "include":
-                    sem = text.find(";", j)
-                    if sem == -1:
+                    sem = self._statement_end(text, j)
+                    if sem >= len(text):
                         out.append(text[i:])
                         break
                     out.append(self._expand_include(text[j:sem], scope, depth))
                     i = sem + 1
                     continue
-                if name == "put":
-                    sem = text.find(";", j)
-                    i = len(text) if sem == -1 else sem + 1
+                if name in ("local", "global"):
+                    # Declarations: consume the statement and register the
+                    # names (empty) so ``&name`` in scope resolves to "".
+                    sem = self._statement_end(text, j)
+                    decls = text[j:sem] if sem < len(text) else text[j:]
+                    for sym in re.split(r"[\s,]+", decls.strip()):
+                        if re.fullmatch(r"[A-Za-z_]\w*", sym):
+                            self.symbols.setdefault(sym.lower(), "")
+                    i = len(text) if sem >= len(text) else sem + 1
+                    continue
+                if name in ("put", "abort", "return", "goto", "label", "symdel",
+                            "window", "display", "sysexec", "syscall", "stop", "leave",
+                            "continue"):
+                    sem = self._statement_end(text, j)
+                    i = len(text) if sem >= len(text) else sem + 1
                     continue
                 if name == "if":
                     txt, ni = self._expand_if(text, j, scope, depth)
@@ -544,13 +598,13 @@ class MacroPreprocessor:
                     break
                 if j < len(text) and text[j] == "(":
                     arg_text, after = _balanced(text, j)
-                    if name in _FUNCS:
+                    if _is_func(name):
                         out.append(self._call_func(name, arg_text, scope, depth))
                     else:
                         out.append(self._invoke(name, arg_text, scope, depth))
                     i = after
                     continue
-                if name in _FUNCS:
+                if _is_func(name):
                     out.append(self._call_func(name, "", scope, depth))
                     i = j
                     continue
@@ -608,6 +662,62 @@ class MacroPreprocessor:
         except Exception:
             return False
 
+    def _statement_end(self, text, start) -> int:
+        """Index of the ``;`` that ends the macro statement beginning at ``start``.
+
+        Unlike ``text.find(";")`` this respects nested ``%do``/``%end`` and
+        ``%if ... %then ... %else`` structures and macro-function parentheses,
+        so a ``%put`` or ``%let`` whose value embeds an ``%if %then %do;`` is not
+        truncated at the first inner ``;`` (which used to leak the rest of the
+        program as unexpanded text)."""
+        i, n = start, len(text)
+        paren = 0
+        bdepth = 0
+        while i < n:
+            ch = text[i]
+            if ch == "(":
+                paren += 1
+            elif ch == ")":
+                paren -= 1
+            if ch == "%":
+                m = re.match(r"%([A-Za-z_]\w*)", text[i:])
+                if m:
+                    kw = m.group(1).lower()
+                    after = i + m.end()
+                    if kw == "do":
+                        bdepth += 1
+                        i = after
+                        continue
+                    if kw == "end":
+                        if bdepth > 0:
+                            bdepth -= 1
+                        i = after
+                        continue
+                    if kw == "if":
+                        ti, tn = _find_top(text, after, ["then"])
+                        if tn == "then":
+                            end = self._branch_end(text, ti + len("%then"))
+                            k = end
+                            while k < n and text[k] in " \t\r\n":
+                                k += 1
+                            m2 = re.match(r"%else\b", text[k:], re.IGNORECASE)
+                            if m2:
+                                end = self._branch_end(text, k + m2.end())
+                            i = end
+                            continue
+                        i = after
+                        continue
+                    if _is_func(kw) and after < n and text[after] == "(":
+                        _, after = _balanced(text, after)
+                        i = after
+                        continue
+                    i = after
+                    continue
+            if ch == ";" and paren <= 0 and bdepth <= 0:
+                return i
+            i += 1
+        return n
+
     def _branch_end(self, text, start) -> int:
         """Index where one branch (a statement or a ``%do``/``%if`` block) ends.
 
@@ -643,8 +753,17 @@ class MacroPreprocessor:
                     if kw == "if":
                         ti, tn = _find_top(text, after, ["then"])
                         if tn == "then":
-                            ek, en = _find_top(text, ti + len("%then"), ["else", "end"])
-                            i = ek if en == "else" else ek
+                            # Skip the whole %if ... %then ... [%else ...],
+                            # including a %do; ... %end; branch, so a nested
+                            # %if does not make the enclosing block end early.
+                            end = self._branch_end(text, ti + len("%then"))
+                            k = end
+                            while k < n and text[k] in " \t\r\n":
+                                k += 1
+                            m2 = re.match(r"%else\b", text[k:], re.IGNORECASE)
+                            if m2:
+                                end = self._branch_end(text, k + m2.end())
+                            i = end
                             continue
                         i = after
                         continue
@@ -652,7 +771,7 @@ class MacroPreprocessor:
                         endi = _matching_mend(text, i)
                         i = endi
                         continue
-                    if kw in _FUNCS and after < n and text[after] == "(":
+                    if _is_func(kw) and after < n and text[after] == "(":
                         _, after = _balanced(text, after)
                         i = after
                         continue
@@ -813,6 +932,12 @@ class MacroPreprocessor:
 
     def _call_func(self, name: str, arg_text: str, scope, depth) -> str:
         try:
+            # The quoting variants (``%qscan``, ``%qsysfunc``, ``%superq``, ...)
+            # behave like their base function once the mask is applied.
+            if name not in _FUNCS and name.startswith("q") and name[1:] in _FUNCS:
+                name = name[1:]
+            if name in ("superq", "unquote", "unquote3"):
+                return self._resolve(arg_text, scope)
             if name in ("str", "nrstr", "bquote", "quote", "nrbquote", "dequote"):
                 return arg_text
             if name in ("unquote", "unquote3"):
@@ -928,7 +1053,7 @@ class MacroPreprocessor:
             return self._resolve(arg_text, scope)
         fn = m.group(1).lower()
         args = [self._resolve(a, scope).strip() for a in _split_commas(m.group(2))]
-        if fn == "countw":
+        if fn in ("countw", "wcount"):
             v = args[0] if args else ""
             delims = args[1] if len(args) > 1 and args[1] else " "
             toks = [t for t in re.split("[" + re.escape(delims) + "]+", v) if t]
@@ -1073,13 +1198,42 @@ def expand_audited(code: str, include_base: Optional[str] = None) -> Tuple[str, 
         proc.audit_data["error"] = str(exc)
 
     residual = sorted(set(_RESIDUAL_RE.findall(out)))
+    # ``%word`` inside a single-quoted string is a LIKE pattern, not a macro.
+    in_strings: set = set()
+    for m in re.finditer(r"'[^']*'", out):
+        in_strings.update(_RESIDUAL_RE.findall(m.group(0)))
+    literals = sorted(t for t in residual if t in in_strings)
+    remaining = [t for t in residual if t not in in_strings]
+
+    # Symbols the program assigns from data (``SELECT ... INTO :x`` or a
+    # computed ``call symput``) cannot be known statically. They are reported
+    # separately as runtime values rather than counted as parser gaps.
+    runtime_names: set = set()
+    for m in re.finditer(r"\bINTO\b([^;]*)", code, re.IGNORECASE):
+        runtime_names.update(x.lower() for x in re.findall(r":([A-Za-z_]\w*)", m.group(1)))
+    for m in re.finditer(r"\bcall\s+symputx?\s*\(\s*['\"]([A-Za-z_]\w*)['\"]",
+                         code, re.IGNORECASE):
+        runtime_names.add(m.group(1).lower())
+
+    def is_runtime(token: str) -> bool:
+        return token.startswith("&") and token[1:].lower() in runtime_names
+
+    runtime_refs = sorted(t for t in remaining if is_runtime(t))
+    blocking = [t for t in remaining if not is_runtime(t)]
+
     audit: Dict[str, object] = dict(proc.audit_data)
     audit["macros_defined"] = sorted(proc.macros)
-    audit["symbols_defined"] = sorted(proc.symbols)
-    audit["residual_refs"] = residual[:200]
-    audit["residual_count"] = len(residual)
+    audit["automatic_symbols"] = sorted(_AUTOMATIC_SYMBOLS)
+    audit["symbols_defined"] = sorted(set(proc.symbols) - set(_AUTOMATIC_SYMBOLS))
+    audit["runtime_symbols"] = sorted(runtime_names)
+    audit["residual_refs"] = blocking[:200]
+    audit["residual_count"] = len(blocking)
+    audit["runtime_refs"] = runtime_refs[:200]
+    audit["string_literals"] = literals[:200]
+    audit["unresolved_macros"] = sorted({t[1:].lower() for t in blocking if t.startswith("%")})
+    audit["unresolved_symbols"] = sorted({t[1:].lower() for t in blocking if t.startswith("&")})
     audit["complete"] = (
-        not residual
+        not blocking
         and not audit.get("truncated")
         and not audit.get("error")
     )
