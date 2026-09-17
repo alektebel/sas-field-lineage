@@ -214,7 +214,7 @@ class TestXlsxWriter(unittest.TestCase):
         inv = build_inventory("libname mrt 'x';\ndata mrt.t; set raw.src; x=1; run;\n")
         sheets = inventory_sheets(inv)
         names = [name for name, _rows in sheets]
-        self.assertEqual(names, ["Persistent tables", "Libraries", "Summary"])
+        self.assertEqual(names, ["Persistent tables", "Libraries", "Summary", "Assurance"])
         rows = next(rows for name, rows in sheets if name == "Persistent tables")
         self.assertIn("Division", rows[0])
         self.assertIn("Library", rows[0])
@@ -241,7 +241,7 @@ class TestXlsxWriter(unittest.TestCase):
         # Every table lives in one sheet; a division is a column value, not a
         # tab, so sorting and filtering work across the whole pipeline.
         self.assertEqual([name for name, _rows in sheets],
-                         ["Persistent tables", "Libraries", "Summary"])
+                         ["Persistent tables", "Libraries", "Summary", "Assurance"])
         rows = sheets[0][1]
         self.assertEqual(len(rows), len(inv["tables"]) + 1)
         # ...and the sheet still reads source -> sink.
